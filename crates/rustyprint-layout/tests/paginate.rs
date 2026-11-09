@@ -309,3 +309,20 @@ fn a_float_inside_a_paragraph_counts_towards_its_table_cells_width() {
     let float = find(&pages[0], "f").rect.width;
     assert!(float >= 300.0, "the float is {float} wide");
 }
+
+#[test]
+fn a_cell_taller_than_its_content_by_its_own_height_still_centres_it() {
+    // The cell is 100px tall because of its height, its content 20px: `vertical-align:
+    // middle` puts the content 40px down.
+    let pages = pages(
+        "<table style='border-spacing: 0'><tr>\
+         <td style='height: 100px; padding: 0; vertical-align: middle'>\
+         <div style='--id: c; width: 50px; height: 20px'></div></td></tr></table>",
+    );
+    let content = find(&pages[0], "c");
+    assert!(
+        (content.rect.y - 40.0).abs() < 0.5,
+        "the content is at {}",
+        content.rect.y
+    );
+}
