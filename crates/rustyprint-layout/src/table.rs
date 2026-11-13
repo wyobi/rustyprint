@@ -949,6 +949,12 @@ fn constraints(table: &Table, spacing: f32) -> Constraints {
     for i in 0..n {
         c.max[i] = c.max[i].max(c.min[i]);
     }
+    // Percentages past 100% in all are cut, from the last column back.
+    let mut left = 1.0_f32;
+    for percent in c.percent.iter_mut().flatten() {
+        *percent = percent.min(left).max(0.0);
+        left -= *percent;
+    }
     c
 }
 

@@ -396,6 +396,16 @@ fn percentage_columns_share_spare_width_in_proportion_to_their_percentages() {
 }
 
 #[test]
+fn percentages_past_a_hundred_are_cut_from_the_last_column_back() {
+    let widths = column_widths(
+        "<td style='--id: a; width: 50%; padding: 0'></td>\
+         <td style='--id: b; width: 30%; padding: 0'></td>\
+         <td style='--id: c; width: 300%; padding: 0'></td>",
+    );
+    assert_widths(widths, [200.0, 120.0, 80.0]);
+}
+
+#[test]
 fn percentage_columns_short_of_width_each_get_the_same_part_of_what_they_lack() {
     // The last column's content takes 300px of the 400px, so the first two, which ask for
     // 120px each, share the remaining 100px.
