@@ -326,3 +326,42 @@ fn a_cell_taller_than_its_content_by_its_own_height_still_centres_it() {
         content.rect.y
     );
 }
+
+#[test]
+fn a_positioned_box_split_by_pages_is_one_containing_block() {
+    // Two rows fit a page, leaving 60px: the box is 300 + 300 + 120 = 720px tall.
+    let row = "<div style='height: 120px; break-inside: avoid'></div>";
+    let pages = pages(&format!(
+        "<div style='position: relative'>\
+           <div style='--id: static; position: absolute; left: 50%'>s</div>\
+           <div style='--id: top; position: absolute; top: 12.5%; height: 10px'></div>\
+           <div style='--id: middle; position: absolute; top: 50%; height: 10px'></div>\
+           <div style='--id: bottom; position: absolute; bottom: 0; height: 20px'></div>\
+           {}\
+         </div>",
+        row.repeat(5)
+    ));
+    assert_eq!(pages.len(), 3);
+    assert_eq!(y_of(&pages[0], "static"), 0.0);
+    assert_eq!(y_of(&pages[0], "top"), 90.0);
+    assert_eq!(y_of(&pages[1], "middle"), 60.0);
+    assert_eq!(y_of(&pages[2], "bottom"), 100.0);
+}
+
+#[test]
+fn a_column_prefers_the_width_of_its_cells_that_have_one() {
+    // The header cells ask for 50, 50 and 100px in a 400px table. The long text below the
+    // second one has no width of its own, so it wraps in the column rather than widening it,
+    // and the columns share the spare 200px in proportion to their widths.
+    let pages = pages(&format!(
+        "<table style='width: 100%; border-collapse: collapse'><tr>\
+         <td style='--id: a; width: 50px; padding: 0'>A</td>\
+         <td style='--id: b; width: 50px; padding: 0'>B</td>\
+         <td style='--id: c; width: 100px; padding: 0'>C</td>\
+         </tr><tr><td style='padding: 0'>1</td><td style='padding: 0'>{}</td>\
+         <td style='padding: 0'></td></tr></table>",
+        "to be or not ".repeat(20)
+    ));
+    let width = |id| find(&pages[0], id).rect.width;
+    assert_eq!((width("a"), width("b"), width("c")), (100.0, 100.0, 200.0));
+}
