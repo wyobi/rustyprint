@@ -1678,9 +1678,16 @@ fn replaced_size_in(
             Some((_, _, vw, vh)) if vw > 0.0 && vh > 0.0 => (vw, vh),
             _ => (w, h),
         });
+    // Content with a shape and no size of its own, such as an SVG image with only a
+    // `viewBox`.
+    let shape = match replaced.size {
+        Some(_) => None,
+        None => replaced.picture.as_ref().and_then(Picture::shape),
+    };
     let natural_ratio = natural
         .filter(|&(w, h)| w > 0.0 && h > 0.0)
-        .map(|(w, h)| w / h);
+        .map(|(w, h)| w / h)
+        .or(shape);
     let given = style.aspect_ratio.value();
     let ratio = if style.aspect_ratio.auto {
         natural_ratio.or(given)
@@ -1701,6 +1708,17 @@ fn replaced_size_in(
         ),
         (None, None) => match (natural, ratio) {
             (Some(n), _) => n,
+            // Content with a shape and no size is as wide as the room it has, as a block
+            // is (§ 10.3.2), and has no width while that room is not known yet.
+            (None, Some(r)) if shape.is_some() => {
+                let known = basis.filter(|&basis| basis < crate::inline::UNLIMITED);
+                let room = known.map_or(0.0, |basis| {
+                    let margins = margin(&style.margin_left, cb.width).unwrap_or(0.0)
+                        + margin(&style.margin_right, cb.width).unwrap_or(0.0);
+                    (basis - margins - extra_w).max(0.0)
+                });
+                (room, room / r)
+            }
             (None, Some(r)) => (default.0, default.0 / r),
             (None, None) => default,
         },
