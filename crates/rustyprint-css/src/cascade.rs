@@ -75,6 +75,8 @@ pub struct StyleOptions<'a> {
     /// `@color-profile` rules. Without it, only `local()` fonts are found and no profiles
     /// load.
     pub load_font: Option<LoadFont<'a>>,
+    /// Whether media queries see a screen, as a browser window does, rather than print.
+    pub screen: bool,
 }
 
 /// Loads a file's bytes by URL.
@@ -533,6 +535,7 @@ impl<'a> Collector<'a> {
         let env = MediaEnvironment {
             width: self.options.media_size.0,
             height: self.options.media_size.1,
+            screen: self.options.screen,
             custom_media: &custom_media,
         };
         let mut flattener = Flattener {
@@ -2439,6 +2442,7 @@ impl Engine<'_> {
             queries.matches(&MediaEnvironment {
                 width: self.options.media_size.0,
                 height: self.options.media_size.1,
+                screen: self.options.screen,
                 custom_media: &self.rules.custom_media,
             })
         };

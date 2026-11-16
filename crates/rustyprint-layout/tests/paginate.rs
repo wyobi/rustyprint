@@ -19,6 +19,7 @@ fn styled(body: &str) -> (Document, rustyprint_css::Styles) {
             load: &load,
             font_metrics: None,
             load_font: None,
+            screen: false,
         },
     );
     (document, styles)
@@ -38,6 +39,7 @@ fn pages_of(html: &str) -> Vec<BoxFragment> {
             load: &load,
             font_metrics: None,
             load_font: None,
+            screen: false,
         },
     );
     layout_pages(

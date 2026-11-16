@@ -1471,6 +1471,7 @@ impl Builder<'_> {
                 load: &load,
                 font_metrics: Some(&crate::font_metrics),
                 load_font: Some(&load_font),
+                screen: false,
             },
         );
         for warning in &styles.warnings {
@@ -2437,6 +2438,7 @@ mod tests {
                 load: &load,
                 font_metrics: None,
                 load_font: None,
+                screen: false,
             },
         );
         build(&document, &styles, &Images::none()).unwrap()
