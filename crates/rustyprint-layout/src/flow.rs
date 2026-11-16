@@ -1631,6 +1631,12 @@ fn replaced_size(block: &BlockBox, replaced: &Replaced, cb: ContainingBlock) -> 
     replaced_size_in(block, replaced, cb, Some(cb.width))
 }
 
+/// The size of a replaced element with neither a size nor a natural size: 300 by 150 CSS
+/// pixels (CSS 2.1 § 10.3.2), which `zoom` scales as it does lengths.
+pub(crate) fn default_object_size(style: &ComputedValues) -> (f32, f32) {
+    (300.0 * style.effective_zoom, 150.0 * style.effective_zoom)
+}
+
 /// The used size of a replaced element whose percentage widths are of `basis`, or with
 /// `None` behave as `auto` and as no limit, as they do while the width of its containing
 /// block is not known yet.
@@ -1682,14 +1688,21 @@ fn replaced_size_in(
         given.or(natural_ratio)
     };
     let (width, height) = (width_of(&style.width), height_of(&style.height));
+    let default = default_object_size(style);
     let (mut w, mut h) = match (width, height) {
         (Some(w), Some(h)) => (w, h),
-        (Some(w), None) => (w, ratio.map_or(natural.map_or(150.0, |n| n.1), |r| w / r)),
-        (None, Some(h)) => (ratio.map_or(natural.map_or(300.0, |n| n.0), |r| h * r), h),
+        (Some(w), None) => (
+            w,
+            ratio.map_or(natural.map_or(default.1, |n| n.1), |r| w / r),
+        ),
+        (None, Some(h)) => (
+            ratio.map_or(natural.map_or(default.0, |n| n.0), |r| h * r),
+            h,
+        ),
         (None, None) => match (natural, ratio) {
             (Some(n), _) => n,
-            (None, Some(r)) => (300.0, 300.0 / r),
-            (None, None) => (300.0, 150.0),
+            (None, Some(r)) => (default.0, default.0 / r),
+            (None, None) => default,
         },
     };
     let min_w = width_of(&style.min_width).unwrap_or(0.0);
