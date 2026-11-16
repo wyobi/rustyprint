@@ -1,0 +1,119 @@
+# Builds this fork's Linux server build and attaches it to a GitHub release of the fork.
+# Publishes nothing anywhere else: no container image, no npm, no gems, no NuGet.
+#
+# Runs for a tag of the fork (v1.2.0-wyobi.12), which is built from the workflow file in the
+# tagged commit. Runs on GitHub's own runners: this repository is public, so it never uses a
+# self-hosted runner.
+
+name: Wyobi build
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+-wyobi.[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wyobi-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98"
+  ZIG_VERSION: "0.14.1"
+  TARGET: x86_64-unknown-linux-gnu
+  # glibc 2.17: the library loads on every Linux the servers run.
+  ZIG_TARGET: x86_64-unknown-linux-gnu.2.17
+
+jobs:
+  build:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wyobi-${{ env.TARGET }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        run: cargo zigbuild --release --locked -p rustyprint-cli -p rustyprint-ffi --target "$ZIG_TARGET"
+      - name: Try the program
+        run: |
+          bin="target/$TARGET/release/rustyprint"
+          "$bin" --version
+          echo '<h1>Hello</h1>' | "$bin" - -o hello.pdf
+          head -c 5 hello.pdf | grep -q '%PDF-'
+      - name: Try the native library
+        run: |
+          lib="target/$TARGET/release"
+          ffi=crates/rustyprint-ffi
+          cc -std=c99 -I "$ffi/include" "$ffi/tests/smoke.c" -L "$lib" -lrustyprint_ffi -Wl,-rpath,"$PWD/$lib" -o smoke
+          ./smoke
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # The package the platform loads: the Node binding with this build's library in native/.
+      - name: Try the Node binding
+        working-directory: bindings/node
+        env:
+          RUSTYPRINT_LIBRARY: ${{ github.workspace }}/target/${{ env.TARGET }}/release/librustyprint_ffi.so
+        run: |
+          npm ci
+          npm test
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != tag ]; then version="$(git rev-parse --short HEAD)"; fi
+          release="target/$TARGET/release"
+          native="rustyprint-native-$version-$TARGET"
+          program="rustyprint-$version-$TARGET"
+          node="rustyprint-node-$version-linux-x64"
+          mkdir -p "dist/$native/include" "dist/$program" "dist/$node/native"
+          cp crates/rustyprint-ffi/README.md LICENSE-MIT LICENSE-APACHE "dist/$native/"
+          cp fonts/OFL.txt "dist/$native/OFL.txt"
+          cp crates/rustyprint-ffi/include/rustyprint.h "dist/$native/include/"
+          cp "$release/librustyprint_ffi.so" "dist/$native/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$release/rustyprint" "dist/$program/"
+          cp fonts/OFL.txt "dist/$program/OFL.txt"
+          (cd bindings/node && cp -R index.js index.d.ts lib package.json package-lock.json README.md "../../dist/$node/")
+          cp LICENSE-MIT LICENSE-APACHE "dist/$node/"
+          cp "$release/librustyprint_ffi.so" "dist/$node/native/"
+          git rev-parse HEAD > "dist/$node/COMMIT"
+          cd dist
+          for name in "$native" "$program" "$node"; do
+            tar -czf "$name.tar.gz" "$name"
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+            cat "$name.tar.gz.sha256"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wyobi-build-linux-x64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - name: Attach to the release of this tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes "Server build of this fork, from commit $GITHUB_SHA."
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/*.sha256
