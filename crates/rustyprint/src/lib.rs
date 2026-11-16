@@ -626,6 +626,26 @@ mod tests {
     }
 
     #[test]
+    fn scale_rounds_the_page_height_up_to_a_whole_pixel_of_the_document() {
+        // At 0.5 a page area 256.3px tall is 512.6px to the document, which is laid out
+        // in 513px: boxes of 513px fit one page, and 514px of them do not.
+        let options = RenderOptions {
+            scale: 0.5,
+            ..RenderOptions::default()
+        };
+        let pages = |second: u32| {
+            let html = format!(
+                "<!DOCTYPE html><style>@page {{ size: 400px 256.3px; margin: 0 }} \
+                 body {{ margin: 0 }} div {{ break-inside: avoid }}</style>\
+                 <div style='height: 256px'>a</div><div style='height: {second}px'>b</div>"
+            );
+            lay_out(&html, &options).unwrap().0.pages.len()
+        };
+        assert_eq!(pages(257), 1);
+        assert_eq!(pages(258), 2);
+    }
+
+    #[test]
     fn scale_must_be_one_a_print_can_have() {
         for scale in [0.0, 0.05, 2.5, f32::NAN] {
             let options = RenderOptions {
