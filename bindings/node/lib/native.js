@@ -26,6 +26,7 @@ try {
 
 koffi.opaque('rp_request')
 koffi.opaque('rp_result')
+koffi.opaque('rp_record_set')
 
 module.exports = {
   rp_version: lib.func('const char *rp_version(void)'),
@@ -43,5 +44,18 @@ module.exports = {
     'const char *rp_result_warnings_json(const rp_result *result, _Out_ size_t *len)'),
   rp_result_error: lib.func('const char *rp_result_error(const rp_result *result, _Out_ size_t *len)'),
   rp_result_free: lib.func('void rp_result_free(rp_result *result)'),
+  rp_record_set_open: lib.func(
+    'int32_t rp_record_set_open(const rp_request *request, _Out_ rp_record_set **out)'),
+  rp_record_set_add: lib.func('int32_t rp_record_set_add(rp_record_set *set, const uint8_t *html, size_t len)'),
+  rp_record_set_finish: lib.func('int32_t rp_record_set_finish(rp_record_set *set)'),
+  rp_record_set_take_output: lib.func(
+    'const uint8_t *rp_record_set_take_output(rp_record_set *set, _Out_ size_t *len)'),
+  rp_record_set_added_pages: lib.func('size_t rp_record_set_added_pages(const rp_record_set *set)'),
+  rp_record_set_warnings_json: lib.func(
+    'const char *rp_record_set_warnings_json(const rp_record_set *set, _Out_ size_t *len)'),
+  rp_record_set_error: lib.func('const char *rp_record_set_error(const rp_record_set *set, _Out_ size_t *len)'),
+  rp_record_set_pages: lib.func('size_t rp_record_set_pages(const rp_record_set *set)'),
+  rp_record_set_records: lib.func('size_t rp_record_set_records(const rp_record_set *set)'),
+  rp_record_set_free: lib.func('void rp_record_set_free(rp_record_set *set)'),
   rp_request_free: lib.func('void rp_request_free(rp_request *request)')
 }

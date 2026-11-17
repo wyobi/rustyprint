@@ -49,6 +49,7 @@ struct LimitOptions {
     max_nodes: Option<usize>,
     max_depth: Option<usize>,
     max_pages: Option<usize>,
+    max_total_pages: Option<usize>,
     max_image_pixels: Option<u64>,
     /// Left out keeps the default; `null` means no deadline.
     #[serde(default, deserialize_with = "nullable")]
@@ -112,7 +113,7 @@ pub(crate) fn from_json(json: &str) -> Result<RenderOptions, Error> {
         max_nodes: limits.max_nodes.unwrap_or(default.max_nodes),
         max_depth: limits.max_depth.unwrap_or(default.max_depth),
         max_pages: limits.max_pages.unwrap_or(default.max_pages),
-        max_total_pages: default.max_total_pages,
+        max_total_pages: limits.max_total_pages.unwrap_or(default.max_total_pages),
         max_image_pixels: limits.max_image_pixels.unwrap_or(default.max_image_pixels),
         timeout: limits
             .timeout_ms

@@ -20,6 +20,10 @@ class Pool {
     this.workers = new Set()
     this.idle = []
     this.running = new Map()
+    // The workers kept for a record set each, which take no other work until released.
+    this.reserved = new Set()
+    // The record sets that keep a worker, to give up when the pool closes.
+    this.sets = new Set()
     this.queue = []
     this.closed = false
   }
@@ -28,11 +32,37 @@ class Pool {
   // window of that size. A signal stops a render that has not started; one that has started
   // runs to the end, bounded by the deadline in its options.
   run (html, options, signal, window) {
+    return this.enqueue({ message: { html, options, window } }, signal)
+  }
+
+  // Keeps a worker for a record set, whose fonts and native set live on one thread: resolves to
+  // the worker once one is free, which then does only what call() sends it, until release().
+  // A signal stops the wait for a worker.
+  reserve (signal) {
+    return this.enqueue({ reserve: true }, signal)
+  }
+
+  // Has a reserved worker do one call of its record set.
+  call (worker, set) {
+    return new Promise((resolve, reject) => {
+      if (!this.workers.has(worker)) return reject(new Error('the render worker of the record set has stopped'))
+      this.post(worker, { message: { set }, resolve, reject })
+    })
+  }
+
+  // Gives a reserved worker back, for the renders that wait.
+  release (worker) {
+    if (!this.reserved.delete(worker) || !this.workers.has(worker)) return
+    this.idle.push(worker)
+    this.drain()
+  }
+
+  enqueue (work, signal) {
     return new Promise((resolve, reject) => {
       if (this.closed) return reject(closedError())
       if (signal?.aborted) return reject(signal.reason)
 
-      const task = { message: { html, options, window }, resolve, reject, signal, onAbort: null }
+      const task = { ...work, resolve, reject, signal, onAbort: null }
       if (signal) {
         task.onAbort = () => {
           const index = this.queue.indexOf(task)
@@ -48,10 +78,12 @@ class Pool {
     })
   }
 
-  // Stops every worker, and refuses the renders still queued and any made later.
+  // Stops every worker, and refuses the renders still queued and any made later. Record sets
+  // that are open are given up first, so that each native set is freed on its own thread.
   async close () {
     this.closed = true
     for (const task of this.queue.splice(0)) task.reject(closedError())
+    await Promise.all([...this.sets].map(set => set.abort()))
     await Promise.all([...this.workers].map(worker => worker.terminate()))
   }
 
@@ -86,12 +118,21 @@ class Pool {
 
   start (worker, task) {
     task.signal?.removeEventListener('abort', task.onAbort)
+    if (task.reserve) {
+      this.reserved.add(worker)
+      worker.unref()
+      task.resolve(worker)
+    } else {
+      this.post(worker, task)
+    }
+  }
+
+  post (worker, task) {
     try {
       worker.postMessage(task.message)
     } catch (error) {
       // Options or assets that cannot be copied to another thread.
-      worker.unref()
-      this.idle.push(worker)
+      this.rest(worker)
       task.reject(error)
       return
     }
@@ -100,21 +141,29 @@ class Pool {
     worker.ref()
   }
 
+  // A worker with nothing to do is free for the next render, unless a record set keeps it.
+  rest (worker) {
+    worker.unref()
+    if (!this.reserved.has(worker)) this.idle.push(worker)
+  }
+
   finish (worker, reply) {
     const task = this.running.get(worker)
     this.running.delete(worker)
-    worker.unref()
-    this.idle.push(worker)
+    this.rest(worker)
 
-    if (reply.error) task.reject(errorFor(reply.error.kind, reply.error.message))
-    else if (reply.width !== undefined) task.resolve(reply.width)
-    else task.resolve({ pdf: Buffer.from(reply.pdf), warnings: reply.warnings })
+    const { error, width, pdf, ...rest } = reply
+    if (error) task.reject(errorFor(error.kind, error.message))
+    else if (width !== undefined) task.resolve(width)
+    // The bytes moved from the worker, as a Buffer over them.
+    else task.resolve(pdf ? { pdf: Buffer.from(pdf), ...rest } : rest)
     this.drain()
   }
 
   fail (worker, error) {
     if (!this.workers.delete(worker)) return
     this.idle = this.idle.filter(other => other !== worker)
+    this.reserved.delete(worker)
     const task = this.running.get(worker)
     this.running.delete(worker)
     task?.reject(error)

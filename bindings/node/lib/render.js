@@ -9,7 +9,7 @@ const { errorFor } = require('./errors')
 const { snakeCase } = require('./options')
 
 // rp_status, by value.
-const STATUS = ['ok', 'invalid_argument', 'invalid_options', 'limit_exceeded', 'timeout', 'internal']
+const STATUS = ['ok', 'invalid_argument', 'invalid_options', 'limit_exceeded', 'timeout', 'internal', 'record_set']
 
 // Text as UTF-8 bytes: a string is encoded, and bytes are taken as they are.
 function bytes (data, what) {
@@ -57,8 +57,13 @@ function renderRequest (request, html) {
 
 // What `work` makes of the document as bytes and a native request with the options and assets.
 function withRequest (html, options, work) {
-  const { assets = {}, ...rest } = options ?? {}
   const document = bytes(html, 'html')
+  return withOptions(options, request => work(request, document))
+}
+
+// What `work` makes of a native request with the options and assets.
+function withOptions (options, work) {
+  const { assets = {}, ...rest } = options ?? {}
   const json = Buffer.from(JSON.stringify(snakeCase(rest)), 'utf8')
 
   const request = native.rp_request_new(json, json.byteLength)
@@ -67,7 +72,7 @@ function withRequest (html, options, work) {
   try {
     const entries = assets instanceof Map ? assets.entries() : Object.entries(assets)
     for (const [path, data] of entries) addAsset(request, path, data)
-    return work(request, document)
+    return work(request)
   } finally {
     native.rp_request_free(request)
   }
@@ -98,8 +103,75 @@ function renderSync (html, options) {
   return { pdf: Buffer.from(pdf), warnings }
 }
 
+// Opens a native record set with the options and assets, for the calling thread to add records
+// to with addRecord, end with finishRecordSet and free with freeRecordSet.
+function openRecordSet (options) {
+  return withOptions(options, request => {
+    const out = [null]
+    const status = native.rp_record_set_open(request, out)
+    const set = out[0]
+    if (set == null) throw errorFor('internal', 'the native library could not make a record set')
+    if (status === 0) return set
+    try {
+      throw recordSetError(set, status)
+    } finally {
+      native.rp_record_set_free(set)
+    }
+  })
+}
+
+function recordSetError (set, status) {
+  return errorFor(STATUS[status], native.rp_record_set_error(set, null))
+}
+
+// The bytes of the PDF written since the last take, as an ArrayBuffer that can move to another
+// thread: a copy, since the set lets go of its own at the next call.
+function takeOutput (set) {
+  const len = [0]
+  const output = native.rp_record_set_take_output(set, len)
+  const length = Number(len[0])
+  return length === 0 ? new ArrayBuffer(0) : koffi.view(output, length).slice(0)
+}
+
+// Prints a document as the next record of the set, and gives the bytes of its pages.
+function addRecord (set, html) {
+  const document = bytes(html, 'html')
+  const status = native.rp_record_set_add(set, document, document.byteLength)
+  if (status !== 0) throw recordSetError(set, status)
+  return {
+    pdf: takeOutput(set),
+    pages: Number(native.rp_record_set_added_pages(set)),
+    warnings: JSON.parse(native.rp_record_set_warnings_json(set, null))
+  }
+}
+
+// Ends the set's PDF, and gives its last bytes with the pages and records of the whole file.
+function finishRecordSet (set) {
+  const status = native.rp_record_set_finish(set)
+  if (status !== 0) throw recordSetError(set, status)
+  return {
+    pdf: takeOutput(set),
+    pages: Number(native.rp_record_set_pages(set)),
+    records: Number(native.rp_record_set_records(set))
+  }
+}
+
+// Frees a native record set, finished or not, and ends its thread.
+function freeRecordSet (set) {
+  native.rp_record_set_free(set)
+}
+
 function nativeVersion () {
   return native.rp_version()
 }
 
-module.exports = { renderBytes, renderSync, contentWidthSync, nativeVersion }
+module.exports = {
+  renderBytes,
+  renderSync,
+  contentWidthSync,
+  openRecordSet,
+  addRecord,
+  finishRecordSet,
+  freeRecordSet,
+  nativeVersion
+}

@@ -11,6 +11,7 @@ sys_includes = ["stddef.h", "stdint.h"]
 [export.rename]
 "Request" = "rp_request"
 "RenderResult" = "rp_result"
+"RecordSet" = "rp_record_set"
 "Status" = "rp_status"
 
 [enum]

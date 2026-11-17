@@ -1,5 +1,7 @@
 /// <reference types="node" />
 
+import type { Readable } from 'node:stream'
+
 /** A page size as a width and height, each a CSS length such as `100mm`. */
 export interface PageSizeDimensions {
   width: string
@@ -32,6 +34,8 @@ export interface Limits {
   maxDepth?: number
   /** Pages in the PDF. Default: 2000. */
   maxPages?: number
+  /** Pages in the PDF of a whole record set, whose records each have `maxPages` at the most. Default: 200000. */
+  maxTotalPages?: number
   /** Width times height of an image. Default: 100000000. */
   maxImagePixels?: number
   /** How long the render may take, or null for no deadline. Default: 60000. */
@@ -98,12 +102,67 @@ export interface RendererOptions {
   concurrency?: number
 }
 
+/** The options of a record set, which every record is printed with. */
+export interface RecordSetOptions extends RenderOptions {
+  /** Stops the set's wait for a worker. A call that has started runs to the end. */
+  signal?: AbortSignal
+}
+
+export interface RecordOutput {
+  /** The bytes of the PDF this record added: they follow the bytes of the calls before. */
+  pdf: Buffer
+  /** How many pages the record took. */
+  pages: number
+  /** Problems found in the record's CSS and assets. */
+  warnings: string[]
+}
+
+export interface RecordSetSummary {
+  /** The last bytes of the PDF: what the whole file shares, such as its fonts and page tree. */
+  pdf: Buffer
+  /** How many pages the PDF has. */
+  pages: number
+  /** How many records were added. */
+  records: number
+}
+
+/**
+ * Many documents printed as one PDF, one record at a time. The bytes that `add` and `finish`
+ * resolve to, in the order of the calls, are the PDF file. Calls run one after another: a call
+ * made while another runs waits for it.
+ *
+ * One worker of the renderer prints the whole set, from the first call until the set is
+ * finished, aborted or fails, and renders nothing else meanwhile. A call that fails ends the
+ * set: the bytes so far are not a whole PDF, and later calls reject with a `RecordSetError`.
+ */
+export interface RecordSet {
+  /** Prints a document as the next record, on the pages after those printed so far. */
+  add (html: string | Uint8Array | ArrayBuffer): Promise<RecordOutput>
+  /** Ends the PDF. A set without records is a PDF without pages. */
+  finish (): Promise<RecordSetSummary>
+  /** Gives the set up and frees its worker. Does nothing to a set that has ended; never rejects. */
+  abort (): Promise<void>
+}
+
+/** A record's HTML, or null or undefined when there are no more records. */
+export type NextRecord = string | Uint8Array | ArrayBuffer | null | undefined
+
+export interface ToReadableOptions {
+  /**
+   * How many bytes the stream holds before it stops asking for records. Default: 0, so a
+   * record is printed only when the consumer asks for more.
+   */
+  highWaterMark?: number
+}
+
 export interface Renderer {
   /** Renders an HTML document to PDF on one of this renderer's workers. */
   render (html: string | Uint8Array | ArrayBuffer, options?: AsyncRenderOptions): Promise<RenderOutput>
   /** Measures the width of a document's content on one of this renderer's workers, as `contentWidth` does. */
   contentWidth (html: string | Uint8Array | ArrayBuffer, window: WindowSize, options?: AsyncRenderOptions): Promise<number>
-  /** Stops the workers. Renders still waiting are refused. */
+  /** Makes a record set that one of this renderer's workers prints, as `createRecordSet` does. */
+  createRecordSet (options?: RecordSetOptions): RecordSet
+  /** Stops the workers. Renders still waiting are refused, and open record sets are aborted. */
   close (): Promise<void>
 }
 
@@ -133,6 +192,26 @@ export function contentWidthSync (html: string | Uint8Array | ArrayBuffer, windo
 /** Makes a renderer with its own workers and concurrency. */
 export function createRenderer (options?: RendererOptions): Renderer
 
+/**
+ * Makes a record set: many documents printed as one PDF, one record at a time, so that the
+ * whole PDF is never in memory. Every record is a document of its own with the set's options;
+ * page numbers run through the set, and `counter(pages)` is the pages of the whole set.
+ * `limits` hold for each record, and `limits.maxTotalPages` for the set.
+ */
+export function createRecordSet (options?: RecordSetOptions): RecordSet
+
+/**
+ * The PDF of a record set as a Readable that prints only what is read. Each time the consumer
+ * wants more, it calls `nextHtml` for the next record, adds it to the set and pushes its
+ * bytes; when `nextHtml` gives null, it finishes the set and pushes the last bytes. A consumer
+ * that stops reading stops the records. An error, or `destroy()`, aborts the set.
+ */
+export function toReadable (
+  set: RecordSet,
+  nextHtml: () => NextRecord | Promise<NextRecord>,
+  options?: ToReadableOptions
+): Readable
+
 /** The native library's version. */
 export function nativeVersion (): string
 
@@ -141,7 +220,7 @@ export const VERSION: string
 
 /** A render that failed. Each kind of failure has its own subclass. */
 export class RustyprintError extends Error {
-  readonly kind: 'invalid_options' | 'limit_exceeded' | 'timeout' | 'internal'
+  readonly kind: 'invalid_options' | 'limit_exceeded' | 'timeout' | 'record_set' | 'internal'
 }
 
 /** The options are not valid, such as an unknown option or page size. */
@@ -157,6 +236,11 @@ export class LimitExceededError extends RustyprintError {
 /** Rendering took longer than the deadline in the options. */
 export class TimeoutError extends RustyprintError {
   readonly kind: 'timeout'
+}
+
+/** The record set cannot go on: an earlier call on it failed, or it is finished or aborted. */
+export class RecordSetError extends RustyprintError {
+  readonly kind: 'record_set'
 }
 
 /** A bug in rustyprint. */

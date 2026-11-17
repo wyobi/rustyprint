@@ -113,6 +113,11 @@
           "type": "integer",
           "minimum": 0
         },
+        "max_total_pages": {
+          "description": "Pages in the PDF of a whole record set, whose records each have max_pages at the most; a single render does not use it. Default: 200000.",
+          "type": "integer",
+          "minimum": 0
+        },
         "max_image_pixels": {
           "description": "Width times height of an image; larger images are skipped with a warning. Default: 100000000.",
           "type": "integer",

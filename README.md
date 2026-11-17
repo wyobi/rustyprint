@@ -136,6 +136,7 @@ Every render runs within limits, so a hostile or broken document cannot run fore
 | DOM nodes | 500,000 | `max_nodes` |
 | Element nesting depth | 512 | `max_depth` |
 | Pages | 2,000 | `max_pages` |
+| Pages of a whole record set | 200,000 | `max_total_pages` |
 | Image size (larger images are skipped with a warning) | 100 megapixels | `max_image_pixels` |
 | Time | 60 seconds | `timeout_ms` (`null` for no limit) |
 

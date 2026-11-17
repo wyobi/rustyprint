@@ -177,9 +177,11 @@ fn json_never_fetches_or_reads_files_by_default() {
 
 #[test]
 fn limits_left_out_keep_their_defaults() {
-    let options = json(r#"{"limits": {"max_pages": 10, "timeout_ms": 500}}"#);
+    let options =
+        json(r#"{"limits": {"max_pages": 10, "max_total_pages": 40, "timeout_ms": 500}}"#);
     let expected = Limits {
         max_pages: 10,
+        max_total_pages: 40,
         timeout: Some(Duration::from_millis(500)),
         ..Limits::default()
     };
@@ -274,6 +276,7 @@ fn schema_describes_every_option() {
             "max_input_bytes",
             "max_nodes",
             "max_pages",
+            "max_total_pages",
             "timeout_ms"
         ])
     );

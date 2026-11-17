@@ -6,7 +6,8 @@ class RustyprintError extends Error {
   constructor (message) {
     super(message)
     this.name = new.target.name
-    // The kind of failure: 'invalid_options', 'limit_exceeded', 'timeout' or 'internal'.
+    // The kind of failure: 'invalid_options', 'limit_exceeded', 'timeout', 'record_set' or
+    // 'internal'.
     this.kind = new.target.kind
   }
 }
@@ -26,6 +27,11 @@ class TimeoutError extends RustyprintError {
   static kind = 'timeout'
 }
 
+// The record set cannot go on: an earlier call on it failed, or it is finished or aborted.
+class RecordSetError extends RustyprintError {
+  static kind = 'record_set'
+}
+
 // A bug in rustyprint.
 class InternalError extends RustyprintError {
   static kind = 'internal'
@@ -35,6 +41,7 @@ const CLASSES = {
   invalid_options: InvalidOptionsError,
   limit_exceeded: LimitExceededError,
   timeout: TimeoutError,
+  record_set: RecordSetError,
   internal: InternalError
 }
 
@@ -51,6 +58,7 @@ module.exports = {
   InvalidOptionsError,
   LimitExceededError,
   TimeoutError,
+  RecordSetError,
   InternalError,
   errorFor
 }

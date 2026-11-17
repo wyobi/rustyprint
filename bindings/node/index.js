@@ -12,11 +12,13 @@
 
 const os = require('node:os')
 const { Pool } = require('./lib/pool')
+const { RecordSet, toReadable } = require('./lib/record-set')
 const {
   RustyprintError,
   InvalidOptionsError,
   LimitExceededError,
   TimeoutError,
+  RecordSetError,
   InternalError
 } = require('./lib/errors')
 
@@ -42,6 +44,9 @@ function createRenderer ({ concurrency = os.availableParallelism() } = {}) {
           'window must be a width and a height in CSS pixels, such as { width: 1280, height: 720 }'))
       }
       return pool.run(html, rest, signal, { width, height })
+    },
+    createRecordSet (options) {
+      return new RecordSet(pool, options)
     },
     close () {
       return pool.close()
@@ -76,6 +81,21 @@ function contentWidthSync (html, window, options) {
   return require('./lib/render').contentWidthSync(html, window, options)
 }
 
+// Makes a record set: many documents printed as one PDF, one record at a time.
+//
+//   const set = createRecordSet({ pageSize: 'A4', assets })
+//   for (const html of records) out.write((await set.add(html)).pdf)
+//   out.end((await set.finish()).pdf)
+//
+// add() resolves to the bytes of that record's pages, and finish() to the last bytes of the
+// file, so the whole PDF is never in memory. One worker of the process's renderer prints the
+// whole set, from its first call until it is finished, aborted or fails; the others keep
+// rendering.
+function createRecordSet (options) {
+  defaultRenderer ??= createRenderer()
+  return defaultRenderer.createRecordSet(options)
+}
+
 // The native library's version.
 function nativeVersion () {
   return require('./lib/render').nativeVersion()
@@ -87,11 +107,14 @@ module.exports = {
   contentWidth,
   contentWidthSync,
   createRenderer,
+  createRecordSet,
+  toReadable,
   nativeVersion,
   VERSION,
   RustyprintError,
   InvalidOptionsError,
   LimitExceededError,
   TimeoutError,
+  RecordSetError,
   InternalError
 }

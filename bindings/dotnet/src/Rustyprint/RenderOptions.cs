@@ -100,6 +100,7 @@ public sealed class RenderOptions
                 if (limits.MaxNodes is { } maxNodes) json.WriteNumber("max_nodes", maxNodes);
                 if (limits.MaxDepth is { } maxDepth) json.WriteNumber("max_depth", maxDepth);
                 if (limits.MaxPages is { } maxPages) json.WriteNumber("max_pages", maxPages);
+                if (limits.MaxTotalPages is { } maxTotalPages) json.WriteNumber("max_total_pages", maxTotalPages);
                 if (limits.MaxImagePixels is { } maxImagePixels) json.WriteNumber("max_image_pixels", maxImagePixels);
                 if (limits.Timeout is { } timeout) WriteMilliseconds(json, "timeout_ms", timeout);
                 json.WriteEndObject();
@@ -221,6 +222,12 @@ public sealed class RenderLimits
 
     /// <summary>Pages in the PDF. Default: 2000.</summary>
     public int? MaxPages { get; set; }
+
+    /// <summary>
+    /// Pages in the PDF of a whole record set, whose records each have <see cref="MaxPages"/> at
+    /// the most; a single render does not use it. Default: 200000.
+    /// </summary>
+    public int? MaxTotalPages { get; set; }
 
     /// <summary>
     /// Width times height of an image; larger images are skipped with a warning.

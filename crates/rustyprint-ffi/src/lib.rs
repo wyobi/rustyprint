@@ -20,17 +20,42 @@
 //! rp_request_free(request);
 //! ```
 //!
+//! A record set prints many documents as one PDF file, one record at a time, and hands over
+//! the bytes of the file as they are written, so neither side holds the whole file:
+//!
+//! ```c
+//! rp_record_set *set = NULL;
+//! size_t len;
+//! const uint8_t *bytes;
+//! if (rp_record_set_open(request, &set) == RP_STATUS_OK) {
+//!     while (next_record(&html) &&
+//!            rp_record_set_add(set, html, strlen(html)) == RP_STATUS_OK) {
+//!         bytes = rp_record_set_take_output(set, &len);
+//!         fwrite(bytes, 1, len, file);
+//!     }
+//!     if (rp_record_set_finish(set) == RP_STATUS_OK) {
+//!         bytes = rp_record_set_take_output(set, &len);
+//!         fwrite(bytes, 1, len, file);
+//!     }
+//! }
+//! if (rp_record_set_error(set, NULL)) fprintf(stderr, "%s\n", rp_record_set_error(set, NULL));
+//! rp_record_set_free(set);
+//! ```
+//!
 //! - Options cross as JSON, in the format of `schema/render-options.schema.json`, so new options
 //!   never change the ABI.
 //! - Text is UTF-8. Options and HTML are a pointer and a length, and need not end in NUL;
 //!   asset paths end in NUL. Strings the library gives end in NUL.
-//! - Requests and results are opaque, and only the library frees them, with
-//!   [`rp_request_free`] and [`rp_result_free`].
+//! - Requests, results and record sets are opaque, and only the library frees them, with
+//!   [`rp_request_free`], [`rp_result_free`] and [`rp_record_set_free`].
 //! - No entry point unwinds into the caller: a panic is caught and reported as
 //!   `RP_STATUS_INTERNAL`.
 //! - A request may render on several threads at once, as long as no thread adds assets to it
 //!   meanwhile. Each render runs on a thread of its own with a large stack, so the calling
 //!   thread's stack size does not matter.
+//! - A record set is used by one thread at a time, and may move from one thread to another
+//!   between calls. It lays its records out on a thread of its own, which it keeps until it
+//!   is finished, a record fails or it is freed.
 
 use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -54,6 +79,9 @@ pub enum Status {
     Timeout = 4,
     /// A bug in rustyprint, such as a caught panic.
     Internal = 5,
+    /// The record set cannot go on: it did not open, a record failed earlier or it is
+    /// finished.
+    RecordSet = 6,
 }
 
 /// Options and assets for rendering documents. Made by `rp_request_new` and freed by
@@ -108,6 +136,107 @@ impl RenderResult {
     }
 }
 
+/// A PDF file printed one record at a time, which hands over the bytes of the file as they
+/// are written. Made by `rp_record_set_open` and freed by `rp_record_set_free`.
+pub struct RecordSet {
+    /// The set while it takes records. Its writer holds the bytes written and not taken yet.
+    set: Option<rustyprint::RecordSet<Vec<u8>>>,
+    /// Why there is no set: it did not open, it is finished, or it did not finish.
+    ended: String,
+    /// The bytes not taken yet of a set that is finished.
+    rest: Vec<u8>,
+    /// The bytes `rp_record_set_take_output` handed over last.
+    taken: Vec<u8>,
+    /// The pages of the record added last.
+    added_pages: usize,
+    /// The warnings of the record added last, as a JSON array of strings.
+    warnings: CString,
+    /// Why the last call failed.
+    error: Option<CString>,
+    pages: usize,
+    records: usize,
+}
+
+impl RecordSet {
+    fn new(set: Result<rustyprint::RecordSet<Vec<u8>>, String>) -> Self {
+        let (set, ended, error) = match set {
+            Ok(set) => (Some(set), String::new(), None),
+            Err(message) => (
+                None,
+                ended(&format!("it did not open: {message}")),
+                Some(c_string(message)),
+            ),
+        };
+        Self {
+            set,
+            ended,
+            rest: Vec::new(),
+            taken: Vec::new(),
+            added_pages: 0,
+            warnings: c"[]".to_owned(),
+            error,
+            pages: 0,
+            records: 0,
+        }
+    }
+
+    /// Forgets what the last call gave: the bytes taken, the record's pages and warnings, and
+    /// the error.
+    fn next_call(&mut self) {
+        self.taken = Vec::new();
+        self.added_pages = 0;
+        self.warnings = c"[]".to_owned();
+        self.error = None;
+    }
+
+    fn fail(&mut self, status: Status, message: impl Into<String>) -> Status {
+        self.error = Some(c_string(message.into()));
+        status
+    }
+
+    fn add(&mut self, html: &str) -> Status {
+        let Some(set) = &mut self.set else {
+            return self.fail(Status::RecordSet, self.ended.clone());
+        };
+        match set.add(html) {
+            Ok(added) => {
+                self.pages = set.pages();
+                self.records += 1;
+                self.added_pages = added.pages;
+                self.warnings = c_string(
+                    serde_json::to_string(&added.warnings).unwrap_or_else(|_| "[]".into()),
+                );
+                Status::Ok
+            }
+            Err(error) => self.fail(status(&error), error.to_string()),
+        }
+    }
+
+    fn finish(&mut self) -> Status {
+        let Some(set) = self.set.take() else {
+            return self.fail(Status::RecordSet, self.ended.clone());
+        };
+        match set.finish() {
+            Ok((bytes, summary)) => {
+                self.rest = bytes;
+                self.pages = summary.pages;
+                self.records = summary.records;
+                self.ended = ended("it is finished");
+                Status::Ok
+            }
+            Err(error) => {
+                self.ended = ended(&format!("it did not finish: {error}"));
+                self.fail(status(&error), error.to_string())
+            }
+        }
+    }
+}
+
+/// Why a set that has ended takes no more calls, worded as the library's own errors are.
+fn ended(why: &str) -> String {
+    Error::RecordSet(why.to_owned()).to_string()
+}
+
 /// `text` as a C string, with any NUL in it replaced.
 fn c_string(text: String) -> CString {
     CString::new(text.replace('\0', "\u{fffd}")).unwrap_or_default()
@@ -118,6 +247,7 @@ fn status(error: &Error) -> Status {
         Error::InvalidOptions(_) => Status::InvalidOptions,
         Error::LimitExceeded { .. } => Status::LimitExceeded,
         Error::Timeout => Status::Timeout,
+        Error::RecordSet(_) => Status::RecordSet,
         _ => Status::Internal,
     }
 }
@@ -453,6 +583,261 @@ unsafe fn string(text: Option<&std::ffi::CStr>, len: *mut usize) -> *const c_cha
     // SAFETY: the caller guarantees `len` is null or writable.
     unsafe { set_len(len, text.map_or(0, |t| t.count_bytes())) };
     text.map_or(ptr::null(), std::ffi::CStr::as_ptr)
+}
+
+/// Opens a record set, which prints many documents as one PDF file one record at a time, with
+/// the request's options and assets, which are copied: the request may be freed or used for
+/// other renders afterwards. Every record is a document of its own with those options; page
+/// numbers run through the set, and `counter(pages)` is the number of pages of the whole set.
+/// Stores the set in `*out`, which the caller frees with `rp_record_set_free`, and returns
+/// `RP_STATUS_OK`, or why the set did not open, with a message that `rp_record_set_error`
+/// gives.
+///
+/// Every call with a non-null `out` stores a set there, even when it fails, unless the
+/// library cannot allocate one. A null `out` returns `RP_STATUS_INVALID_ARGUMENT`.
+///
+/// The set lays its records out on a thread of its own, which ends when the set is finished,
+/// when a record fails and when the set is freed.
+///
+/// # Safety
+///
+/// `request` is null or a live request that no thread is adding assets to. `out` is null or
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_open(
+    request: *const Request,
+    out: *mut *mut RecordSet,
+) -> Status {
+    if out.is_null() {
+        return Status::InvalidArgument;
+    }
+    let unopened = |status, message: String| (status, RecordSet::new(Err(message)));
+    let (status, set) = guard(
+        || {
+            unopened(
+                Status::Internal,
+                "internal error: rp_record_set_open panicked".into(),
+            )
+        },
+        || {
+            // SAFETY: the caller guarantees the request is null or live.
+            let Some(request) = (unsafe { request.as_ref() }) else {
+                return unopened(Status::InvalidArgument, "request is null".into());
+            };
+            let options = match &request.options {
+                Ok(options) => options,
+                Err(message) => return unopened(Status::InvalidOptions, message.clone()),
+            };
+            match rustyprint::RecordSet::open(Vec::new(), options) {
+                Ok(set) => (Status::Ok, RecordSet::new(Ok(set))),
+                Err(error) => unopened(status(&error), error.to_string()),
+            }
+        },
+    );
+    // SAFETY: `out` is not null, and the caller guarantees it is writable.
+    unsafe { *out = Box::into_raw(Box::new(set)) };
+    status
+}
+
+/// Prints `len` bytes of UTF-8 HTML at `html` as the next record of the set, on the pages
+/// after those written so far. Returns `RP_STATUS_OK`, with the bytes of the record's pages
+/// ready for `rp_record_set_take_output`, its pages for `rp_record_set_added_pages` and its
+/// warnings for `rp_record_set_warnings_json`; or why it failed, with a message that
+/// `rp_record_set_error` gives. Nothing of the record is kept but those bytes, so a caller
+/// that takes them after every record has the library hold one record at a time.
+///
+/// A record that fails ends the set: what was written is not a whole PDF file, and every
+/// later call fails with `RP_STATUS_RECORD_SET`. So does a call on a set that did not open
+/// or is finished. HTML that is null or not UTF-8 is `RP_STATUS_INVALID_ARGUMENT`, and
+/// leaves the set as it was. A null set returns `RP_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using. Unless `len` is zero, `html`
+/// is null or points to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_add(
+    set: *mut RecordSet,
+    html: *const c_char,
+    len: usize,
+) -> Status {
+    guard(
+        || Status::Internal,
+        || {
+            // SAFETY: the caller guarantees the set is null, or live and not in use elsewhere.
+            let Some(set) = (unsafe { set.as_mut() }) else {
+                return Status::InvalidArgument;
+            };
+            set.next_call();
+            // SAFETY: the caller guarantees the bytes are readable.
+            let Some(html) = (unsafe { bytes(html.cast(), len) }) else {
+                return set.fail(
+                    Status::InvalidArgument,
+                    format!("html is null but len is {len}"),
+                );
+            };
+            match std::str::from_utf8(html) {
+                Ok(html) => set.add(html),
+                Err(e) => set.fail(Status::InvalidArgument, format!("html is not UTF-8: {e}")),
+            }
+        },
+    )
+}
+
+/// Ends the file: writes what the whole file shares, such as its fonts, its page tree and
+/// the number of pages that `counter(pages)` prints. Returns `RP_STATUS_OK`, with those last
+/// bytes ready for `rp_record_set_take_output`; or why it failed, with a message that
+/// `rp_record_set_error` gives. A set without records is a file without pages.
+///
+/// The set takes no more records, and still has to be freed. A null set returns
+/// `RP_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_finish(set: *mut RecordSet) -> Status {
+    guard(
+        || Status::Internal,
+        || {
+            // SAFETY: the caller guarantees the set is null, or live and not in use elsewhere.
+            let Some(set) = (unsafe { set.as_mut() }) else {
+                return Status::InvalidArgument;
+            };
+            set.next_call();
+            set.finish()
+        },
+    )
+}
+
+/// Takes the bytes of the file written since the last take: those that follow the bytes
+/// taken before. Their length is stored in `*len` unless `len` is null. Null, with a length
+/// of zero, when nothing was written since, and for a null set.
+///
+/// The bytes live until the next `rp_record_set_add`, `rp_record_set_finish` or
+/// `rp_record_set_take_output` with the set, or until it is freed; the set holds them
+/// nowhere else. A caller takes them after every record and after finishing, in that order,
+/// and has the whole file; bytes not taken wait in the set and come with the next take.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using. `len` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_take_output(
+    set: *mut RecordSet,
+    len: *mut usize,
+) -> *const u8 {
+    guard(ptr::null, || {
+        // SAFETY: the caller guarantees the set is null, or live and not in use elsewhere.
+        let taken = unsafe { set.as_mut() }.map(|set| {
+            set.taken = match &mut set.set {
+                Some(records) => std::mem::take(records.writer_mut()),
+                None => std::mem::take(&mut set.rest),
+            };
+            &set.taken
+        });
+        // SAFETY: the caller guarantees `len` is null or writable.
+        unsafe { set_len(len, taken.map_or(0, Vec::len)) };
+        taken
+            .filter(|bytes| !bytes.is_empty())
+            .map_or(ptr::null(), |bytes| bytes.as_ptr())
+    })
+}
+
+/// How many pages the record added last took. Zero if it failed, after
+/// `rp_record_set_finish` and for a null set.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_added_pages(set: *const RecordSet) -> usize {
+    // SAFETY: the caller guarantees the set is null or live.
+    guard(
+        || 0,
+        || unsafe { set.as_ref() }.map_or(0, |s| s.added_pages),
+    )
+}
+
+/// The warnings of the record added last, as a NUL-terminated JSON array of strings, with
+/// its length in bytes, not counting the NUL, stored in `*len` unless `len` is null. `[]` if
+/// there are none, if the record failed and after `rp_record_set_finish`; null only for a
+/// null set. The string lives until the next `rp_record_set_add` or `rp_record_set_finish`
+/// with the set, or until it is freed.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using. `len` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_warnings_json(
+    set: *const RecordSet,
+    len: *mut usize,
+) -> *const c_char {
+    // SAFETY: the caller guarantees the set is null or live.
+    guard(ptr::null, || unsafe {
+        string(set.as_ref().map(|s| s.warnings.as_c_str()), len)
+    })
+}
+
+/// Why the last `rp_record_set_open`, `rp_record_set_add` or `rp_record_set_finish` with the
+/// set failed, as a NUL-terminated message, with its length in bytes, not counting the NUL,
+/// stored in `*len` unless `len` is null. Null, with a length of zero, if it succeeded. The
+/// string lives until the next `rp_record_set_add` or `rp_record_set_finish` with the set,
+/// or until it is freed.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using. `len` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_error(
+    set: *const RecordSet,
+    len: *mut usize,
+) -> *const c_char {
+    // SAFETY: the caller guarantees the set is null or live.
+    guard(ptr::null, || unsafe {
+        string(set.as_ref().and_then(|s| s.error.as_deref()), len)
+    })
+}
+
+/// How many pages the set has so far: after `rp_record_set_finish`, the pages of the file.
+/// Zero for a null set.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_pages(set: *const RecordSet) -> usize {
+    // SAFETY: the caller guarantees the set is null or live.
+    guard(|| 0, || unsafe { set.as_ref() }.map_or(0, |s| s.pages))
+}
+
+/// How many records the set has so far: after `rp_record_set_finish`, the records of the
+/// file. Zero for a null set.
+///
+/// # Safety
+///
+/// `set` is null or a live record set no other thread is using.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_records(set: *const RecordSet) -> usize {
+    // SAFETY: the caller guarantees the set is null or live.
+    guard(|| 0, || unsafe { set.as_ref() }.map_or(0, |s| s.records))
+}
+
+/// Frees a record set, with the bytes, warnings and error it holds, and ends its thread. A
+/// set may be freed at any point: one that is not finished is given up, and what was written
+/// is not a whole PDF file. Null does nothing.
+///
+/// # Safety
+///
+/// `set` is null or a live record set from `rp_record_set_open`, which no other thread is
+/// using and which is not used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rp_record_set_free(set: *mut RecordSet) {
+    if !set.is_null() {
+        // SAFETY: the caller guarantees the set came from `rp_record_set_open` and is not used
+        // again.
+        guard(|| (), || drop(unsafe { Box::from_raw(set) }));
+    }
 }
 
 /// Frees a request. Null does nothing.

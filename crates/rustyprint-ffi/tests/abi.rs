@@ -5,9 +5,12 @@ use std::ptr;
 use std::thread;
 
 use rustyprint_ffi::{
-    RenderResult as RpResult, Request, Status, rp_content_width, rp_render, rp_request_add_asset,
-    rp_request_free, rp_request_new, rp_result_content_width, rp_result_error, rp_result_free,
-    rp_result_pdf, rp_result_status, rp_result_warnings_json, rp_version,
+    RecordSet, RenderResult as RpResult, Request, Status, rp_content_width, rp_record_set_add,
+    rp_record_set_added_pages, rp_record_set_error, rp_record_set_finish, rp_record_set_free,
+    rp_record_set_open, rp_record_set_pages, rp_record_set_records, rp_record_set_take_output,
+    rp_record_set_warnings_json, rp_render, rp_request_add_asset, rp_request_free, rp_request_new,
+    rp_result_content_width, rp_result_error, rp_result_free, rp_result_pdf, rp_result_status,
+    rp_result_warnings_json, rp_version,
 };
 
 /// A request with the given JSON options, or the defaults for `None`.
@@ -414,6 +417,228 @@ fn a_request_renders_on_several_threads_at_once() {
     });
     free(request as *mut Request);
     assert!(lengths.iter().all(|&len| len > 0));
+}
+
+/// A record set opened with the given JSON options, and the status of opening it.
+fn open_set(options: Option<&str>) -> (Status, *mut RecordSet) {
+    let request = request(options);
+    let mut set: *mut RecordSet = ptr::null_mut();
+    // SAFETY: the request is live and `set` is writable.
+    let status = unsafe { rp_record_set_open(request, &mut set) };
+    assert!(!set.is_null(), "every open gives a set");
+    // The set has its own copy of the options.
+    free(request);
+    (status, set)
+}
+
+fn add_record(set: *mut RecordSet, html: &str) -> Status {
+    // SAFETY: the set is live and the HTML is a live string.
+    unsafe { rp_record_set_add(set, html.as_ptr().cast(), html.len()) }
+}
+
+/// The bytes the set wrote since the last take.
+fn take_output(set: *mut RecordSet) -> Vec<u8> {
+    let mut len = usize::MAX;
+    // SAFETY: the set is live and `len` is writable.
+    let bytes = unsafe { rp_record_set_take_output(set, &mut len) };
+    if bytes.is_null() {
+        assert_eq!(len, 0, "no bytes have a length of zero");
+        return Vec::new();
+    }
+    // SAFETY: the library gives `len` bytes at `bytes`, live until the next call.
+    unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+}
+
+fn set_error(set: *const RecordSet) -> Option<String> {
+    // SAFETY: the set is live.
+    let error = unsafe { rp_record_set_error(set, ptr::null_mut()) };
+    (!error.is_null()).then(|| {
+        // SAFETY: the error is a NUL-terminated string.
+        unsafe { CStr::from_ptr(error) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    })
+}
+
+fn free_set(set: *mut RecordSet) {
+    // SAFETY: the set came from `rp_record_set_open` and is freed once.
+    unsafe { rp_record_set_free(set) };
+}
+
+#[test]
+fn a_record_set_hands_over_one_pdf_a_record_at_a_time() {
+    let (status, set) = open_set(Some(r#"{"page_size": "A5"}"#));
+    assert_eq!(status, Status::Ok);
+    assert_eq!(set_error(set), None);
+
+    let records = [
+        "<style>p { colr: red }</style><p>One</p>",
+        "<p>Two</p><p style='break-before: page'>Two, again</p>",
+        "<p>Three</p>",
+    ];
+    let mut pdf = Vec::new();
+    for (record, pages) in records.into_iter().zip([1, 2, 1]) {
+        assert_eq!(add_record(set, record), Status::Ok);
+        // SAFETY: the set is live.
+        assert_eq!(unsafe { rp_record_set_added_pages(set) }, pages);
+        let taken = take_output(set);
+        assert!(!taken.is_empty(), "a record's pages are written by its add");
+        pdf.extend(taken);
+        assert!(take_output(set).is_empty(), "the bytes are taken once");
+    }
+    assert!(pdf.starts_with(b"%PDF-"));
+    assert!(lopdf::Document::load_mem(&pdf).is_err(), "not a file yet");
+
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_finish(set) }, Status::Ok);
+    pdf.extend(take_output(set));
+    // SAFETY: the set is live.
+    let summary = unsafe { (rp_record_set_pages(set), rp_record_set_records(set)) };
+    assert_eq!(summary, (4, 3));
+    assert_eq!(pages(&pdf).len(), 4);
+
+    assert_eq!(add_record(set, "<p>Four</p>"), Status::RecordSet);
+    assert!(set_error(set).unwrap().contains("finished"));
+    free_set(set);
+}
+
+#[test]
+fn a_record_set_gives_the_warnings_of_the_last_record() {
+    let (_, set) = open_set(None);
+    let warnings = |set: *const RecordSet| {
+        let mut len = usize::MAX;
+        // SAFETY: the set is live and `len` is writable.
+        let warnings = unsafe { rp_record_set_warnings_json(set, &mut len) };
+        // SAFETY: the warnings are a NUL-terminated string `len` bytes long.
+        let warnings = unsafe { CStr::from_ptr(warnings) }.to_str().unwrap();
+        assert_eq!(warnings.len(), len);
+        serde_json::from_str::<Vec<String>>(warnings).unwrap()
+    };
+    assert_eq!(
+        add_record(set, "<style>p { colr: red }</style><p>x</p>"),
+        Status::Ok
+    );
+    assert!(warnings(set).join("").contains("colr"));
+    assert_eq!(add_record(set, "<p>x</p>"), Status::Ok);
+    assert!(warnings(set).is_empty());
+    free_set(set);
+}
+
+#[test]
+fn bytes_not_taken_come_with_the_next_take() {
+    let (_, set) = open_set(None);
+    assert_eq!(add_record(set, "<p>One</p>"), Status::Ok);
+    assert_eq!(add_record(set, "<p>Two</p>"), Status::Ok);
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_finish(set) }, Status::Ok);
+    assert_eq!(pages(&take_output(set)).len(), 2);
+    free_set(set);
+}
+
+#[test]
+fn a_record_that_fails_ends_the_set() {
+    let (status, set) = open_set(Some(r#"{"limits": {"max_total_pages": 2}}"#));
+    assert_eq!(status, Status::Ok);
+    assert_eq!(add_record(set, "<p>One</p>"), Status::Ok);
+    let two_pages = "<p>Two</p><p style='break-before: page'>Three</p>";
+    assert_eq!(add_record(set, two_pages), Status::LimitExceeded);
+    assert!(set_error(set).is_some());
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_added_pages(set) }, 0);
+
+    assert_eq!(add_record(set, "<p>Four</p>"), Status::RecordSet);
+    assert!(set_error(set).unwrap().contains("an earlier record failed"));
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_finish(set) }, Status::RecordSet);
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_records(set) }, 1);
+    free_set(set);
+}
+
+#[test]
+fn a_record_set_with_invalid_options_does_not_open() {
+    let (status, set) = open_set(Some(r#"{"page_size": "B99"}"#));
+    assert_eq!(status, Status::InvalidOptions);
+    assert!(set_error(set).unwrap().contains("B99"));
+    assert_eq!(add_record(set, "<p>x</p>"), Status::RecordSet);
+    assert!(set_error(set).unwrap().contains("did not open"));
+    assert!(take_output(set).is_empty());
+    free_set(set);
+}
+
+#[test]
+fn record_set_arguments_that_are_null_or_not_utf8_are_invalid() {
+    let (_, set) = open_set(None);
+    // SAFETY: the set is live, and null HTML with a length is refused before it is read.
+    let status = unsafe { rp_record_set_add(set, ptr::null(), 5) };
+    assert_eq!(status, Status::InvalidArgument);
+    let not_utf8 = [b'<', 0xff, b'>'];
+    // SAFETY: the set is live and the HTML is a live slice.
+    let status = unsafe { rp_record_set_add(set, not_utf8.as_ptr().cast(), not_utf8.len()) };
+    assert_eq!(status, Status::InvalidArgument);
+    assert!(set_error(set).unwrap().contains("UTF-8"));
+    // The set is as it was.
+    assert_eq!(add_record(set, "<p>x</p>"), Status::Ok);
+    free_set(set);
+
+    // SAFETY: null sets and a null `out` are refused before they are read.
+    unsafe {
+        assert_eq!(
+            rp_record_set_open(ptr::null(), ptr::null_mut()),
+            Status::InvalidArgument
+        );
+        assert_eq!(
+            rp_record_set_add(ptr::null_mut(), c"x".as_ptr(), 1),
+            Status::InvalidArgument
+        );
+        assert_eq!(
+            rp_record_set_finish(ptr::null_mut()),
+            Status::InvalidArgument
+        );
+        assert!(rp_record_set_take_output(ptr::null_mut(), ptr::null_mut()).is_null());
+        assert!(rp_record_set_warnings_json(ptr::null(), ptr::null_mut()).is_null());
+        assert_eq!(rp_record_set_pages(ptr::null()), 0);
+        rp_record_set_free(ptr::null_mut());
+    }
+    let mut set: *mut RecordSet = ptr::null_mut();
+    // SAFETY: a null request is refused, and `set` is writable.
+    let status = unsafe { rp_record_set_open(ptr::null(), &mut set) };
+    assert_eq!(status, Status::InvalidArgument);
+    assert_eq!(set_error(set).as_deref(), Some("request is null"));
+    free_set(set);
+}
+
+#[test]
+fn a_record_set_freed_in_the_middle_ends_its_thread() {
+    // Freeing joins the set's thread, so a thread that was left behind would hang this test,
+    // and one set after another would run out of threads.
+    for _ in 0..50 {
+        let (_, set) = open_set(None);
+        assert_eq!(add_record(set, "<p>x</p>"), Status::Ok);
+        free_set(set);
+    }
+}
+
+#[test]
+fn a_record_set_moves_between_threads() {
+    let (_, set) = open_set(None);
+    let set = set as usize;
+    for i in 0..3 {
+        thread::spawn(move || {
+            assert_eq!(
+                add_record(set as *mut RecordSet, &format!("<p>{i}</p>")),
+                Status::Ok
+            );
+        })
+        .join()
+        .unwrap();
+    }
+    let set = set as *mut RecordSet;
+    // SAFETY: the set is live, and no other thread is using it.
+    assert_eq!(unsafe { rp_record_set_finish(set) }, Status::Ok);
+    assert_eq!(pages(&take_output(set)).len(), 3);
+    free_set(set);
 }
 
 #[test]

@@ -77,7 +77,9 @@ fn a_c_program_renders_through_the_library() {
     std::fs::create_dir_all(&out).unwrap();
     let exe = compile(&library, &out);
 
+    let pdf = out.join("record-set.pdf");
     let mut command = Command::new(&exe);
+    command.arg(&pdf);
     if cfg!(windows) {
         // Windows finds DLLs on the PATH.
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -96,4 +98,8 @@ fn a_c_program_renders_through_the_library() {
         "{stdout}"
     );
     assert!(stdout.trim_end().ends_with("ok"), "{stdout}");
+
+    // The bytes the program took from the record set, a record at a time, are one PDF file.
+    let document = lopdf::Document::load(&pdf).expect("the record set is a PDF file");
+    assert_eq!(document.get_pages().len(), 4);
 }

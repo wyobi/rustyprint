@@ -76,6 +76,7 @@ public class OptionsSchemaTests
                 MaxNodes = 10_000,
                 MaxDepth = 100,
                 MaxPages = 10,
+                MaxTotalPages = 40,
                 MaxImagePixels = 1_000_000,
                 Timeout = TimeSpan.FromSeconds(30),
             },

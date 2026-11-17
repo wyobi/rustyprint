@@ -49,6 +49,42 @@ const { pdf } = await render(html, { pageSize: 'A4', landscape: true, margin: '2
 
 `contentWidthSync` measures on the calling thread. Of the options, the stylesheet, the assets and the limits apply.
 
+## Record sets: many documents as one PDF, streamed
+
+A record set prints many documents, such as a statement per customer, as one PDF, one record at a time. Each `add` resolves to the bytes that record added to the file, and `finish` to the last bytes, so neither rustyprint nor your process ever holds the whole PDF.
+
+```js
+const { createRecordSet, toReadable } = require('rustyprint')
+
+const set = createRecordSet({ pageSize: 'A4', assets: { 'logo.png': logo } })
+const rows = db.query('SELECT * FROM statements').cursor()
+
+// Pull mode: a record is read, printed and sent only when the response wants more.
+const pdf = toReadable(set, async () => {
+  const row = await rows.next()
+  return row ? statementHtml(row) : null
+})
+response.setHeader('Content-Type', 'application/pdf')
+pdf.pipe(response)
+```
+
+`toReadable(set, nextHtml)` is a Readable that calls `nextHtml` and prints its record only when the consumer asks for more bytes, and finishes the set when `nextHtml` gives null. A slow download therefore stops the records being read and printed, instead of the PDF piling up in memory. An error, or `destroy()`, aborts the set.
+
+The set can be driven by hand as well:
+
+```js
+const { pdf, pages, warnings } = await set.add(html) // the bytes of this record's pages
+const { pdf, pages, records } = await set.finish()   // the last bytes, and the totals
+await set.abort()                                    // or give the set up
+```
+
+- Every record is a document of its own with the set's options and assets, and starts on a new page. Page numbers run through the set, and `counter(pages)` is the number of pages of the whole set, so `"Page " counter(page) " of " counter(pages)` works across records.
+- Fonts are embedded once, and an image used by many records is written once.
+- `limits` hold for each record; `limits.maxTotalPages` (200,000 by default) bounds the set.
+- One worker prints the whole set, from its first call until it is finished, aborted or fails, and renders nothing else meanwhile; the renderer's other workers keep rendering. `createRenderer({ concurrency })` has `createRecordSet` too.
+- Calls on a set run one after another: a call made while another runs waits for it.
+- A call that fails ends the set: the bytes so far are not a whole PDF, and later calls reject with a `RecordSetError`. Always `finish` or `abort` a set, so that its worker goes back to the others.
+
 ## Threads
 
 `render` runs each render on a worker thread, so the event loop keeps running meanwhile. It stays off libuv's thread pool too, which file system, DNS, crypto and zlib calls share. At most `os.availableParallelism()` renders run at once; the others wait their turn.
@@ -67,7 +103,7 @@ await renderer.close()
 
 ## Errors
 
-Every failure is a `RustyprintError`, with a subclass and a `kind` for each kind: `InvalidOptionsError` (`'invalid_options'`), `LimitExceededError` (`'limit_exceeded'`), `TimeoutError` (`'timeout'`) and `InternalError` (`'internal'`, a bug in rustyprint). Arguments that are not valid, such as HTML bytes that are not UTF-8, are a `TypeError`.
+Every failure is a `RustyprintError`, with a subclass and a `kind` for each kind: `InvalidOptionsError` (`'invalid_options'`), `LimitExceededError` (`'limit_exceeded'`), `TimeoutError` (`'timeout'`), `RecordSetError` (`'record_set'`, a call on a record set that has failed, finished or been aborted) and `InternalError` (`'internal'`, a bug in rustyprint). Arguments that are not valid, such as HTML bytes that are not UTF-8, are a `TypeError`.
 
 ## Platforms
 
