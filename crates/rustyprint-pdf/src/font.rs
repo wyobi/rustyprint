@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, UnicodeCmap};
-use pdf_writer::{Filter, Finish, Name, Pdf, Rect, Ref, Str};
+use pdf_writer::{Filter, Name, Rect, Ref, Str};
 use rustyprint_layout::Font;
 use subsetter::GlyphRemapper;
 
+use crate::sink::Sink;
 use crate::{COMPRESSION_LEVEL, Error, Refs};
 
 const IDENTITY: SystemInfo<'static> = SystemInfo {
@@ -60,7 +61,11 @@ impl FontResource {
     }
 
     /// Writes the font objects.
-    pub fn write(&self, pdf: &mut Pdf, refs: &mut Refs) -> Result<(), Error> {
+    pub fn write<W: std::io::Write>(
+        &self,
+        sink: &mut Sink<W>,
+        refs: &mut Refs,
+    ) -> Result<(), Error> {
         let cid_font_id = refs.next();
         let descriptor_id = refs.next();
         let file_id = refs.next();
@@ -93,32 +98,36 @@ impl FontResource {
         let base_font = format!("{}+{}", self.subset_tag(), self.font.postscript_name());
         let base_font = Name(base_font.as_bytes());
 
-        pdf.type0_font(self.type0_id)
-            .base_font(base_font)
-            .encoding_predefined(Name(b"Identity-H"))
-            .descendant_font(cid_font_id)
-            .to_unicode(cmap_id);
+        sink.object(|chunk| {
+            chunk
+                .type0_font(self.type0_id)
+                .base_font(base_font)
+                .encoding_predefined(Name(b"Identity-H"))
+                .descendant_font(cid_font_id)
+                .to_unicode(cmap_id);
+        })?;
 
-        let mut cid_font = pdf.cid_font(cid_font_id);
-        cid_font
-            .subtype(if cff {
-                CidFontType::Type0
-            } else {
-                CidFontType::Type2
-            })
-            .base_font(base_font)
-            .system_info(IDENTITY)
-            .font_descriptor(descriptor_id);
-        if !cff {
-            cid_font.cid_to_gid_map_predefined(Name(b"Identity"));
-        }
         let widths: Vec<f32> = self
             .remapper
             .remapped_gids()
             .map(|glyph| self.width(glyph))
             .collect();
-        cid_font.widths().consecutive(0, widths);
-        cid_font.finish();
+        sink.object(|chunk| {
+            let mut cid_font = chunk.cid_font(cid_font_id);
+            cid_font
+                .subtype(if cff {
+                    CidFontType::Type0
+                } else {
+                    CidFontType::Type2
+                })
+                .base_font(base_font)
+                .system_info(IDENTITY)
+                .font_descriptor(descriptor_id);
+            if !cff {
+                cid_font.cid_to_gid_map_predefined(Name(b"Identity"));
+            }
+            cid_font.widths().consecutive(0, widths);
+        })?;
 
         let face = self.font.descriptor();
         let to_em = |value: i16| f32::from(value) * 1000.0 / f32::from(self.font.units_per_em());
@@ -127,42 +136,48 @@ impl FontResource {
         let mut flags = FontFlags::SYMBOLIC;
         flags.set(FontFlags::ITALIC, face.italic);
         flags.set(FontFlags::FIXED_PITCH, face.monospaced);
-        let mut descriptor = pdf.font_descriptor(descriptor_id);
-        descriptor
-            .name(base_font)
-            .flags(flags)
-            .bbox(Rect::new(
-                to_em(x_min),
-                to_em(y_min),
-                to_em(x_max),
-                to_em(y_max),
-            ))
-            .italic_angle(face.italic_angle)
-            .ascent(to_em(face.ascender))
-            .descent(to_em(face.descender))
-            .cap_height(to_em(face.cap_height))
-            // PDF requires a stem width, which fonts don't record; estimate it from the weight.
-            .stem_v(10.0 + 0.244 * (f32::from(weight) - 50.0));
-        if cff {
-            descriptor.font_file3(file_id);
-        } else {
-            descriptor.font_file2(file_id);
-        }
-        descriptor.finish();
+        sink.object(|chunk| {
+            let mut descriptor = chunk.font_descriptor(descriptor_id);
+            descriptor
+                .name(base_font)
+                .flags(flags)
+                .bbox(Rect::new(
+                    to_em(x_min),
+                    to_em(y_min),
+                    to_em(x_max),
+                    to_em(y_max),
+                ))
+                .italic_angle(face.italic_angle)
+                .ascent(to_em(face.ascender))
+                .descent(to_em(face.descender))
+                .cap_height(to_em(face.cap_height))
+                // PDF requires a stem width, which fonts don't record; estimate it from the
+                // weight.
+                .stem_v(10.0 + 0.244 * (f32::from(weight) - 50.0));
+            if cff {
+                descriptor.font_file3(file_id);
+            } else {
+                descriptor.font_file2(file_id);
+            }
+        })?;
 
         let data = compress_to_vec_zlib(&subset, COMPRESSION_LEVEL);
-        let mut stream = pdf.stream(file_id, &data);
-        stream.filter(Filter::FlateDecode);
-        if cff {
-            stream.pair(Name(b"Subtype"), Name(b"OpenType"));
-        }
-        stream.finish();
+        sink.object(|chunk| {
+            let mut stream = chunk.stream(file_id, &data);
+            stream.filter(Filter::FlateDecode);
+            if cff {
+                stream.pair(Name(b"Subtype"), Name(b"OpenType"));
+            }
+        })?;
 
         let mut cmap = UnicodeCmap::new(Name(b"Custom"), IDENTITY);
         for (&cid, text) in &self.to_unicode {
             cmap.pair_with_multiple(cid, text.chars());
         }
-        pdf.cmap(cmap_id, &cmap.finish());
+        let cmap = cmap.finish();
+        sink.object(|chunk| {
+            chunk.cmap(cmap_id, &cmap);
+        })?;
         Ok(())
     }
 

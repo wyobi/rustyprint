@@ -3,7 +3,11 @@
 //! Output is deterministic: the same document always produces the same bytes.
 
 mod font;
+mod sink;
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::sync::Arc;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
@@ -11,18 +15,20 @@ use pdf_writer::types::{
     ActionType, AnnotationType, BlendMode as PdfBlendMode, FunctionShadingType, LineCapStyle,
     LineJoinStyle, MaskType, TextRenderingMode,
 };
-use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
+use pdf_writer::writers::{Catalog, DocumentInfo};
+use pdf_writer::{Content, Filter, Finish, Name, Rect, Ref, Str, TextStr};
 use rustyprint_layout::display::Group;
 use rustyprint_layout::display::LineStyle;
 use rustyprint_layout::display::PrintMarks;
 use rustyprint_layout::display::{
-    Bookmark, Destination, Document, LinkTarget, Page, Shading, ShadingKind,
+    ColorProfile, Destination, Document, LinkTarget, Page, Shading, ShadingKind,
 };
 use rustyprint_layout::{
     Color, DisplayItem, FillRule, Font, Image, ImageData, Path, PathSegment, Point, TextRun,
 };
 
 use crate::font::FontResource;
+use crate::sink::Sink;
 
 /// CSS pixels to PDF points.
 const PX_TO_PT: f32 = 0.75;
@@ -39,7 +45,7 @@ const MAX_COMPRESSION_THREADS: usize = 8;
 /// Pages whose content streams wait for compression, per compressing thread.
 const PAGES_PER_THREAD: usize = 4;
 
-/// Errors returned by [`write`].
+/// Errors returned by [`write`] and [`Session`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to subset font {name}: {source}")]
@@ -47,39 +53,86 @@ pub enum Error {
         name: String,
         source: subsetter::Error,
     },
+    #[error("failed to write the PDF: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Writes `document` as a PDF file.
 pub fn write(document: &Document) -> Result<Vec<u8>, Error> {
-    let mut writer = Writer {
-        pdf: Pdf::new(),
-        refs: Refs::default(),
-        fonts: Vec::new(),
-        alphas: Vec::new(),
-        images: Vec::new(),
-        shadings: 0,
-        groups: 0,
-        palette: Palette::default(),
-    };
-    writer.write(document)?;
-    Ok(writer.pdf.finish())
+    let mut session = Session::new(Vec::new(), Setup::of(document))?;
+    session.add_pages(document)?;
+    session.finish()
 }
 
-struct Writer {
-    pdf: Pdf,
+/// What is the same for a whole PDF file, however many batches of pages it is written in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Setup<'a> {
+    /// Document title for the file's metadata.
+    pub title: Option<&'a str>,
+    /// The ICC profiles that native colors refer to by index.
+    pub color_profiles: &'a [ColorProfile],
+    /// The profile of `device-cmyk()` colors, an index into `color_profiles`; without one
+    /// they are device CMYK.
+    pub device_cmyk: Option<u32>,
+}
+
+impl<'a> Setup<'a> {
+    /// The title and color profiles of `document`.
+    pub fn of(document: &'a Document) -> Self {
+        Self {
+            title: document.title.as_deref(),
+            color_profiles: &document.color_profiles,
+            device_cmyk: document.device_cmyk,
+        }
+    }
+}
+
+/// One PDF file written a batch of pages at a time: each batch is written as it is added,
+/// so its pages need not be kept.
+///
+/// Every object is one write to the writer, so a file is best wrapped in a
+/// [`std::io::BufWriter`]. After an error the file is incomplete and the session cannot go
+/// on.
+pub struct Session<W: Write> {
+    sink: Sink<W>,
     refs: Refs,
+    catalog_id: Ref,
+    page_tree_id: Ref,
+    info_id: Ref,
+    /// The pages written so far.
+    page_ids: Vec<Ref>,
+    /// The bookmarks of the pages written so far, for the outline.
+    outline: Vec<OutlineEntry>,
     /// Fonts in order of first use, so object numbering is deterministic.
     fonts: Vec<FontResource>,
     /// Graphics states for each alpha value used, by alpha.
     alphas: Vec<(u8, Ref)>,
     /// Images in order of first use.
     images: Vec<ImageResource>,
+    /// The images written so far by what they hold, so that an image that comes again in a
+    /// later batch is written once without the session keeping its pixels.
+    image_keys: HashMap<ImageKey, usize>,
+    /// The images of the batch being written, by where they are in memory, so that an
+    /// image a batch repeats is hashed once. Empty between batches.
+    batch_images: Vec<(usize, bool, usize)>,
+    /// How many of `images` are written: an image is written with the first page that
+    /// uses it.
+    images_written: usize,
     /// Shadings written so far, for unique resource names.
     shadings: usize,
     /// Groups written so far, for unique resource names.
     groups: usize,
     /// How native colors are written.
     palette: Palette,
+}
+
+/// A bookmark whose target is resolved to a page object.
+struct OutlineEntry {
+    level: u8,
+    title: String,
+    page: Ref,
+    /// The top edge in PDF coordinates.
+    top: f32,
 }
 
 /// How native colors are written: the document's color profiles as ICC-based color spaces.
@@ -155,60 +208,98 @@ fn compress_all(streams: Vec<Vec<u8>>, threads: usize) -> Vec<Vec<u8>> {
     })
 }
 
-impl Writer {
-    /// Compresses content streams and writes them under their IDs.
-    fn write_streams(&mut self, pending: Vec<(Ref, Vec<u8>)>, threads: usize) {
-        let (ids, streams): (Vec<Ref>, Vec<Vec<u8>>) = pending.into_iter().unzip();
-        for (id, data) in ids.into_iter().zip(compress_all(streams, threads)) {
-            self.pdf.stream(id, &data).filter(Filter::FlateDecode);
-        }
-    }
-
-    fn write(&mut self, document: &Document) -> Result<(), Error> {
-        let catalog_id = self.refs.next();
-        let page_tree_id = self.refs.next();
-        let page_ids: Vec<Ref> = document.pages.iter().map(|_| self.refs.next()).collect();
-
-        let outline_id = (!document.bookmarks.is_empty()).then(|| self.refs.next());
-        let mut catalog = self.pdf.catalog(catalog_id);
-        catalog.pages(page_tree_id);
-        if let Some(outline_id) = outline_id {
-            catalog.outlines(outline_id);
-        }
-        catalog.finish();
-        self.pdf
-            .pages(page_tree_id)
-            .kids(page_ids.iter().copied())
-            .count(page_ids.len() as i32);
-
-        let mut annotations: Vec<Vec<Ref>> = Vec::with_capacity(page_ids.len());
+impl<W: Write> Session<W> {
+    /// Starts a PDF file in `writer`.
+    pub fn new(writer: W, setup: Setup<'_>) -> Result<Self, Error> {
+        let mut sink = Sink::new(writer)?;
+        let mut refs = Refs::default();
+        // The catalog and the page tree are written last, when the pages are known.
+        let catalog_id = refs.next();
+        let page_tree_id = refs.next();
         // Color profiles are written once, and every content stream can use them.
-        for (index, profile) in document.color_profiles.iter().enumerate() {
-            let id = self.refs.next();
+        let mut palette = Palette {
+            profiles: Vec::with_capacity(setup.color_profiles.len()),
+            device_cmyk: setup.device_cmyk,
+        };
+        for (index, profile) in setup.color_profiles.iter().enumerate() {
+            let id = refs.next();
             let data = compress_to_vec_zlib(&profile.data, COMPRESSION_LEVEL);
-            let mut stream = self.pdf.icc_profile(id, &data);
-            stream.filter(Filter::FlateDecode);
-            stream.n(profile.components as i32);
-            let alternate = match profile.components {
-                1 => Name(b"DeviceGray"),
-                4 => Name(b"DeviceCMYK"),
-                _ => Name(b"DeviceRGB"),
-            };
-            stream.alternate_name(alternate);
-            stream.finish();
-            self.palette
+            sink.object(|chunk| {
+                let mut stream = chunk.icc_profile(id, &data);
+                stream.filter(Filter::FlateDecode);
+                stream.n(profile.components as i32);
+                let alternate = match profile.components {
+                    1 => Name(b"DeviceGray"),
+                    4 => Name(b"DeviceCMYK"),
+                    _ => Name(b"DeviceRGB"),
+                };
+                stream.alternate_name(alternate);
+            })?;
+            palette
                 .profiles
                 .push((format!("Cs{index}"), id, profile.components));
         }
-        self.palette.device_cmyk = document.device_cmyk;
+        let info_id = refs.next();
+        sink.object(|chunk| {
+            let mut info = chunk.indirect(info_id).start::<DocumentInfo>();
+            info.producer(TextStr("rustyprint"));
+            if let Some(title) = setup.title {
+                info.title(TextStr(title));
+            }
+        })?;
+        Ok(Self {
+            sink,
+            refs,
+            catalog_id,
+            page_tree_id,
+            info_id,
+            page_ids: Vec::new(),
+            outline: Vec::new(),
+            fonts: Vec::new(),
+            alphas: Vec::new(),
+            images: Vec::new(),
+            image_keys: HashMap::new(),
+            batch_images: Vec::new(),
+            images_written: 0,
+            shadings: 0,
+            groups: 0,
+            palette,
+        })
+    }
+
+    /// How many pages are written so far.
+    pub fn page_count(&self) -> usize {
+        self.page_ids.len()
+    }
+
+    /// The writer. When [`Session::add_pages`] returns, the writer has every byte of the
+    /// file so far, so what it holds can be taken: the session keeps count of the bytes
+    /// itself.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.sink.get_mut()
+    }
+
+    /// Writes the pages of `document` after the pages already written, with the images and
+    /// links they use. The targets of its links and bookmarks are pages of `document`. Its
+    /// title and color profiles are not used: those of the [`Setup`] hold for the file.
+    pub fn add_pages(&mut self, document: &Document) -> Result<(), Error> {
+        let result = self.write_pages(document);
+        // The images of the batch may be gone from memory after it.
+        self.batch_images.clear();
+        result
+    }
+
+    fn write_pages(&mut self, document: &Document) -> Result<(), Error> {
+        // Links can point to a later page of the batch, so its pages take their IDs first.
+        let batch: Vec<Ref> = document.pages.iter().map(|_| self.refs.next()).collect();
         // Content streams are compressed in parallel, a batch of pages at a time, and written
         // after their pages under the IDs taken in page order.
         let threads = compression_threads();
         let mut pending: Vec<(Ref, Vec<u8>)> = Vec::new();
-        for (page, &page_id) in document.pages.iter().zip(&page_ids) {
+        for (page, &page_id) in document.pages.iter().zip(&batch) {
             rustyprint_dom::budget::check_deadline();
             if pending.len() >= threads * PAGES_PER_THREAD {
-                self.write_streams(std::mem::take(&mut pending), threads);
+                self.write_streams(std::mem::take(&mut pending), threads)?;
             }
             let width = page.size.width * PX_TO_PT;
             let height = page.size.height * PX_TO_PT;
@@ -220,47 +311,116 @@ impl Writer {
                 marks(&mut content, page.marks, width, height, bleed);
             }
             let mut used = Resources::default();
-            self.render(&mut content, &mut used, &page.items, height);
+            self.render(&mut content, &mut used, &page.items, height)?;
             let content_id = self.refs.next();
             pending.push((content_id, content.finish().into_vec()));
 
             // Content is drawn from the trim box's corner; the media box grows around it for
             // the bleed and the marks.
             let extent = bleed + if marked { MARKS_AREA } else { 0.0 };
-            let mut page_writer = self.pdf.page(page_id);
-            page_writer
-                .parent(page_tree_id)
-                .media_box(Rect::new(-extent, -extent, width + extent, height + extent))
-                .contents(content_id);
-            if extent > 0.0 {
-                page_writer
-                    .bleed_box(Rect::new(-bleed, -bleed, width + bleed, height + bleed))
-                    .trim_box(Rect::new(0.0, 0.0, width, height));
-            }
-            if page.rotate != 0 {
-                page_writer.rotate(page.rotate);
-            }
             let link_ids: Vec<Ref> = page.links.iter().map(|_| self.refs.next()).collect();
-            if !link_ids.is_empty() {
-                page_writer.annotations(link_ids.iter().copied());
-            }
-            annotations.push(link_ids);
-            write_resources(
-                &mut page_writer.resources(),
-                &used,
-                &self.fonts,
-                &self.alphas,
-                &self.images,
-                &self.palette,
-            );
+            self.sink.object(|chunk| {
+                let mut page_writer = chunk.page(page_id);
+                // The contents are an array, so that a page can get more streams than one.
+                page_writer
+                    .parent(self.page_tree_id)
+                    .media_box(Rect::new(-extent, -extent, width + extent, height + extent))
+                    .contents_array([content_id]);
+                if extent > 0.0 {
+                    page_writer
+                        .bleed_box(Rect::new(-bleed, -bleed, width + bleed, height + bleed))
+                        .trim_box(Rect::new(0.0, 0.0, width, height));
+                }
+                if page.rotate != 0 {
+                    page_writer.rotate(page.rotate);
+                }
+                if !link_ids.is_empty() {
+                    page_writer.annotations(link_ids.iter().copied());
+                }
+                write_resources(
+                    &mut page_writer.resources(),
+                    &used,
+                    &self.fonts,
+                    &self.alphas,
+                    &self.images,
+                    &self.palette,
+                );
+            })?;
+            self.write_links(document, &batch, page, &link_ids)?;
+            self.write_images()?;
+            self.page_ids.push(page_id);
         }
-        self.write_streams(pending, threads);
+        self.write_streams(pending, threads)?;
 
-        for (page, ids) in document.pages.iter().zip(&annotations) {
-            let height = page.size.height * PX_TO_PT;
-            for (link, &id) in page.links.iter().zip(ids) {
-                let rect = link.rect;
-                let mut annotation = self.pdf.annotation(id);
+        if !batch.is_empty() {
+            for bookmark in &document.bookmarks {
+                let (page, top) = target(document, &batch, &bookmark.target);
+                self.outline.push(OutlineEntry {
+                    level: bookmark.level,
+                    title: bookmark.title.clone(),
+                    page,
+                    top,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes what the whole file shares (the outline, the fonts, the page tree and the
+    /// catalog) and the cross-reference table, and returns the writer.
+    pub fn finish(mut self) -> Result<W, Error> {
+        let outline_id = if self.outline.is_empty() {
+            None
+        } else {
+            let id = self.refs.next();
+            self.write_outline(id)?;
+            Some(id)
+        };
+
+        for font in &self.fonts {
+            font.write(&mut self.sink, &mut self.refs)?;
+        }
+
+        self.sink.object(|chunk| {
+            chunk
+                .pages(self.page_tree_id)
+                .kids(self.page_ids.iter().copied())
+                .count(self.page_ids.len() as i32);
+        })?;
+        self.sink.object(|chunk| {
+            let mut catalog = chunk.indirect(self.catalog_id).start::<Catalog>();
+            catalog.pages(self.page_tree_id);
+            if let Some(outline_id) = outline_id {
+                catalog.outlines(outline_id);
+            }
+        })?;
+        Ok(self.sink.finish(self.catalog_id, self.info_id)?)
+    }
+
+    /// Compresses content streams and writes them under their IDs.
+    fn write_streams(&mut self, pending: Vec<(Ref, Vec<u8>)>, threads: usize) -> Result<(), Error> {
+        let (ids, streams): (Vec<Ref>, Vec<Vec<u8>>) = pending.into_iter().unzip();
+        for (id, data) in ids.into_iter().zip(compress_all(streams, threads)) {
+            self.sink.object(|chunk| {
+                chunk.stream(id, &data).filter(Filter::FlateDecode);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Writes the link annotations of `page`, a page of `document`, whose pages are `batch`.
+    fn write_links(
+        &mut self,
+        document: &Document,
+        batch: &[Ref],
+        page: &Page,
+        ids: &[Ref],
+    ) -> Result<(), Error> {
+        let height = page.size.height * PX_TO_PT;
+        for (link, &id) in page.links.iter().zip(ids) {
+            let rect = link.rect;
+            self.sink.object(|chunk| {
+                let mut annotation = chunk.annotation(id);
                 annotation
                     .subtype(AnnotationType::Link)
                     .rect(Rect::new(
@@ -278,7 +438,7 @@ impl Writer {
                             .uri(Str(uri.as_bytes()));
                     }
                     LinkTarget::Internal(destination) => {
-                        let (page, top) = target(document, &page_ids, destination);
+                        let (page, top) = target(document, batch, destination);
                         annotation
                             .action()
                             .action_type(ActionType::GoTo)
@@ -287,36 +447,20 @@ impl Writer {
                             .xyz(0.0, top, None);
                     }
                 }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Writes the images that no page before used, and lets go of their pixels.
+    fn write_images(&mut self) -> Result<(), Error> {
+        for index in self.images_written..self.images.len() {
+            if let Some(image) = self.images[index].pending.take() {
+                let (id, smooth) = (self.images[index].id, self.images[index].smooth);
+                self.write_image(&image, id, smooth)?;
             }
         }
-
-        if let Some(outline_id) = outline_id {
-            self.outline(outline_id, document, &page_ids);
-        }
-
-        for resource in std::mem::take(&mut self.images) {
-            self.write_image(&resource);
-        }
-
-        for &(alpha, id) in &self.alphas {
-            let value = f32::from(alpha) / 255.0;
-            self.pdf
-                .ext_graphics(id)
-                .non_stroking_alpha(value)
-                .stroking_alpha(value);
-        }
-
-        for font in &self.fonts {
-            font.write(&mut self.pdf, &mut self.refs)?;
-        }
-
-        let info_id = self.refs.next();
-        let mut info = self.pdf.document_info(info_id);
-        info.producer(TextStr("rustyprint"));
-        if let Some(title) = &document.title {
-            info.title(TextStr(title));
-        }
-        info.finish();
+        self.images_written = self.images.len();
         Ok(())
     }
 
@@ -328,14 +472,14 @@ impl Writer {
         res: &mut Resources,
         items: &[DisplayItem],
         height: f32,
-    ) {
+    ) -> Result<(), Error> {
         let mut index = 0;
         while index < items.len() {
             let item = &items[index];
             index += 1;
             if let DisplayItem::PushGroup(group) = item {
                 let end = group_end(items, index);
-                self.group(content, res, group, &items[index..end], height);
+                self.group(content, res, group, &items[index..end], height)?;
                 index = (end + 1).min(items.len());
                 continue;
             }
@@ -349,6 +493,13 @@ impl Writer {
                 if !self.alphas.iter().any(|(a, _)| *a == alpha) {
                     let id = self.refs.next();
                     self.alphas.push((alpha, id));
+                    let value = f32::from(alpha) / 255.0;
+                    self.sink.object(|chunk| {
+                        chunk
+                            .ext_graphics(id)
+                            .non_stroking_alpha(value)
+                            .stroking_alpha(value);
+                    })?;
                 }
             }
             match item {
@@ -503,11 +654,11 @@ impl Writer {
                         rect.width * PX_TO_PT,
                         rect.height * PX_TO_PT,
                     ));
-                    content.x_object(Name(self.images[index].name.as_bytes()));
+                    content.x_object(Name(image_name(index).as_bytes()));
                     content.restore_state();
                 }
                 DisplayItem::Gradient { rect, shading } => {
-                    let resource = self.shading(shading, height);
+                    let resource = self.shading(shading, height)?;
                     content.save_state();
                     content.rect(
                         rect.x * PX_TO_PT,
@@ -558,6 +709,7 @@ impl Writer {
                 content.restore_state();
             }
         }
+        Ok(())
     }
 
     /// Writes the items of a group as a transparency group XObject and paints it with the
@@ -569,35 +721,36 @@ impl Writer {
         group: &Group,
         items: &[DisplayItem],
         height: f32,
-    ) {
+    ) -> Result<(), Error> {
         let mut inner = Content::new();
         let mut used = Resources::default();
-        self.render(&mut inner, &mut used, items, height);
+        self.render(&mut inner, &mut used, items, height)?;
         let data = compress_to_vec_zlib(&inner.finish(), COMPRESSION_LEVEL);
         let form_id = self.refs.next();
-        let mut form = self.pdf.form_xobject(form_id, &data);
-        form.filter(Filter::FlateDecode);
-        form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
-        form.group()
-            .transparency()
-            .isolated(group.isolated)
-            .knockout(false)
-            .color_space()
-            .device_rgb();
-        write_resources(
-            &mut form.resources(),
-            &used,
-            &self.fonts,
-            &self.alphas,
-            &self.images,
-            &self.palette,
-        );
-        form.finish();
+        self.sink.object(|chunk| {
+            let mut form = chunk.form_xobject(form_id, &data);
+            form.filter(Filter::FlateDecode);
+            form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
+            form.group()
+                .transparency()
+                .isolated(group.isolated)
+                .knockout(false)
+                .color_space()
+                .device_rgb();
+            write_resources(
+                &mut form.resources(),
+                &used,
+                &self.fonts,
+                &self.alphas,
+                &self.images,
+                &self.palette,
+            );
+        })?;
 
-        let mask = group.mask.as_ref().map(|mask| {
+        let mut mask_form = None;
+        if let Some(mask) = &group.mask {
             let index = self.image_index(&mask.image, true);
-            let image = &self.images[index];
-            let (image_name, image_id) = (image.name.clone(), image.id);
+            let (image_name, image_id) = (image_name(index), self.images[index].id);
             let r = mask.rect;
             let mut mask_content = Content::new();
             mask_content.save_state();
@@ -613,29 +766,31 @@ impl Writer {
             mask_content.restore_state();
             let data = mask_content.finish();
             let mask_id = self.refs.next();
-            let mut form = self.pdf.form_xobject(mask_id, &data);
-            form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
-            form.group().transparency().color_space().device_gray();
-            form.resources()
-                .x_objects()
-                .pair(Name(image_name.as_bytes()), image_id);
-            form.finish();
-            mask_id
-        });
+            self.sink.object(|chunk| {
+                let mut form = chunk.form_xobject(mask_id, &data);
+                form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
+                form.group().transparency().color_space().device_gray();
+                form.resources()
+                    .x_objects()
+                    .pair(Name(image_name.as_bytes()), image_id);
+            })?;
+            mask_form = Some(mask_id);
+        }
 
         let state_id = self.refs.next();
-        let mut state = self.pdf.ext_graphics(state_id);
-        state
-            .non_stroking_alpha(group.opacity)
-            .stroking_alpha(group.opacity)
-            .blend_mode(blend_mode(group.blend));
-        if let Some(mask_id) = mask {
+        self.sink.object(|chunk| {
+            let mut state = chunk.ext_graphics(state_id);
             state
-                .soft_mask()
-                .subtype(MaskType::Luminosity)
-                .group(mask_id);
-        }
-        state.finish();
+                .non_stroking_alpha(group.opacity)
+                .stroking_alpha(group.opacity)
+                .blend_mode(blend_mode(group.blend));
+            if let Some(mask_id) = mask_form {
+                state
+                    .soft_mask()
+                    .subtype(MaskType::Luminosity)
+                    .group(mask_id);
+            }
+        })?;
 
         self.groups += 1;
         let state_name = format!("GS{}", self.groups);
@@ -646,12 +801,13 @@ impl Writer {
         content.restore_state();
         res.states.push((state_name, state_id));
         res.forms.push((form_name, form_id));
+        Ok(())
     }
 
     /// Writes the document outline: each bookmark nests under the closest one before it with
     /// a lower level.
-    fn outline(&mut self, outline_id: Ref, document: &Document, page_ids: &[Ref]) {
-        let bookmarks: &[Bookmark] = &document.bookmarks;
+    fn write_outline(&mut self, outline_id: Ref) -> Result<(), Error> {
+        let bookmarks = std::mem::take(&mut self.outline);
         let ids: Vec<Ref> = bookmarks.iter().map(|_| self.refs.next()).collect();
         let mut parents: Vec<Option<usize>> = Vec::with_capacity(bookmarks.len());
         let mut open: Vec<usize> = Vec::new();
@@ -678,40 +834,44 @@ impl Writer {
         }
 
         let top = &children[bookmarks.len()];
-        self.pdf
-            .outline(outline_id)
-            .first(ids[top[0]])
-            .last(ids[top[top.len() - 1]])
-            .count(bookmarks.len() as i32);
+        self.sink.object(|chunk| {
+            chunk
+                .outline(outline_id)
+                .first(ids[top[0]])
+                .last(ids[top[top.len() - 1]])
+                .count(bookmarks.len() as i32);
+        })?;
         for (index, bookmark) in bookmarks.iter().enumerate() {
             let siblings = &children[parents[index].unwrap_or(bookmarks.len())];
             let position = siblings
                 .iter()
                 .position(|&i| i == index)
                 .expect("a bookmark is among its parent's children");
-            let mut item = self.pdf.outline_item(ids[index]);
-            item.title(TextStr(&bookmark.title))
-                .parent(parents[index].map_or(outline_id, |p| ids[p]));
-            if position > 0 {
-                item.prev(ids[siblings[position - 1]]);
-            }
-            if let Some(&next) = siblings.get(position + 1) {
-                item.next(ids[next]);
-            }
-            let kids = &children[index];
-            if let (Some(&first), Some(&last)) = (kids.first(), kids.last()) {
-                item.first(ids[first])
-                    .last(ids[last])
-                    .count(descendants[index]);
-            }
-            let (page, top) = target(document, page_ids, &bookmark.target);
-            item.dest().page(page).xyz(0.0, top, None);
+            self.sink.object(|chunk| {
+                let mut item = chunk.outline_item(ids[index]);
+                item.title(TextStr(&bookmark.title))
+                    .parent(parents[index].map_or(outline_id, |p| ids[p]));
+                if position > 0 {
+                    item.prev(ids[siblings[position - 1]]);
+                }
+                if let Some(&next) = siblings.get(position + 1) {
+                    item.next(ids[next]);
+                }
+                let kids = &children[index];
+                if let (Some(&first), Some(&last)) = (kids.first(), kids.last()) {
+                    item.first(ids[first])
+                        .last(ids[last])
+                        .count(descendants[index]);
+                }
+                item.dest().page(bookmark.page).xyz(0.0, bookmark.top, None);
+            })?;
         }
+        Ok(())
     }
 
     /// Writes a shading, and for stops that are not all opaque a graphics state whose soft
     /// mask is a gray shading of their alpha.
-    fn shading(&mut self, shading: &Shading, page_height: f32) -> ShadingResource {
+    fn shading(&mut self, shading: &Shading, page_height: f32) -> Result<ShadingResource, Error> {
         let index = self.shadings;
         self.shadings += 1;
         let color: Vec<(f32, Vec<f32>)> = shading
@@ -719,7 +879,7 @@ impl Writer {
             .iter()
             .map(|(t, c)| (*t, vec![channel(c.r), channel(c.g), channel(c.b)]))
             .collect();
-        let id = self.shading_object(shading, &color, page_height);
+        let id = self.shading_object(shading, &color, page_height)?;
         let mask = if shading.stops.iter().all(|(_, c)| c.a == 255) {
             None
         } else {
@@ -728,7 +888,7 @@ impl Writer {
                 .iter()
                 .map(|(t, c)| (*t, vec![channel(c.a)]))
                 .collect();
-            let mask_shading = self.shading_object(shading, &alpha, page_height);
+            let mask_shading = self.shading_object(shading, &alpha, page_height)?;
             let mut content = Content::new();
             if let Some(matrix) = ellipse_matrix(shading, page_height) {
                 content.transform(matrix);
@@ -736,24 +896,27 @@ impl Writer {
             content.shading(Name(b"Sh"));
             let data = content.finish();
             let form_id = self.refs.next();
-            let mut form = self.pdf.form_xobject(form_id, &data);
-            form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
-            form.group().transparency().color_space().device_gray();
-            form.resources().shadings().pair(Name(b"Sh"), mask_shading);
-            form.finish();
+            self.sink.object(|chunk| {
+                let mut form = chunk.form_xobject(form_id, &data);
+                form.bbox(Rect::new(-1.0e5, -1.0e5, 1.0e5, 1.0e5));
+                form.group().transparency().color_space().device_gray();
+                form.resources().shadings().pair(Name(b"Sh"), mask_shading);
+            })?;
             let state_id = self.refs.next();
-            self.pdf
-                .ext_graphics(state_id)
-                .soft_mask()
-                .subtype(MaskType::Luminosity)
-                .group(form_id);
+            self.sink.object(|chunk| {
+                chunk
+                    .ext_graphics(state_id)
+                    .soft_mask()
+                    .subtype(MaskType::Luminosity)
+                    .group(form_id);
+            })?;
             Some((format!("M{index}"), state_id))
         };
-        ShadingResource {
+        Ok(ShadingResource {
             name: format!("Sh{index}"),
             id,
             mask,
-        }
+        })
     }
 
     /// Writes a shading dictionary whose function gives `values` at its stops: three RGB
@@ -763,43 +926,44 @@ impl Writer {
         shading: &Shading,
         values: &[(f32, Vec<f32>)],
         page_height: f32,
-    ) -> Ref {
-        let function = self.stops_function(values);
+    ) -> Result<Ref, Error> {
+        let function = self.stops_function(values)?;
         let id = self.refs.next();
-        let mut dict = self.pdf.function_shading(id);
-        match shading.kind {
-            ShadingKind::Axial { start, end } => {
-                dict.shading_type(FunctionShadingType::Axial).coords([
-                    start.x * PX_TO_PT,
-                    page_height - start.y * PX_TO_PT,
-                    end.x * PX_TO_PT,
-                    page_height - end.y * PX_TO_PT,
-                ]);
+        self.sink.object(|chunk| {
+            let mut dict = chunk.function_shading(id);
+            match shading.kind {
+                ShadingKind::Axial { start, end } => {
+                    dict.shading_type(FunctionShadingType::Axial).coords([
+                        start.x * PX_TO_PT,
+                        page_height - start.y * PX_TO_PT,
+                        end.x * PX_TO_PT,
+                        page_height - end.y * PX_TO_PT,
+                    ]);
+                }
+                ShadingKind::Radial { center, r0, r1, .. } => {
+                    let (x, y) = (center.x * PX_TO_PT, page_height - center.y * PX_TO_PT);
+                    dict.shading_type(FunctionShadingType::Radial).coords([
+                        x,
+                        y,
+                        r0 * PX_TO_PT,
+                        x,
+                        y,
+                        r1 * PX_TO_PT,
+                    ]);
+                }
             }
-            ShadingKind::Radial { center, r0, r1, .. } => {
-                let (x, y) = (center.x * PX_TO_PT, page_height - center.y * PX_TO_PT);
-                dict.shading_type(FunctionShadingType::Radial).coords([
-                    x,
-                    y,
-                    r0 * PX_TO_PT,
-                    x,
-                    y,
-                    r1 * PX_TO_PT,
-                ]);
+            if values.first().is_some_and(|(_, v)| v.len() == 1) {
+                dict.color_space().device_gray();
+            } else {
+                dict.color_space().device_rgb();
             }
-        }
-        if values.first().is_some_and(|(_, v)| v.len() == 1) {
-            dict.color_space().device_gray();
-        } else {
-            dict.color_space().device_rgb();
-        }
-        dict.function(function).extend([true, true]);
-        dict.finish();
-        id
+            dict.function(function).extend([true, true]);
+        })?;
+        Ok(id)
     }
 
     /// A function over [0, 1] that interpolates linearly between the values at the stops.
-    fn stops_function(&mut self, stops: &[(f32, Vec<f32>)]) -> Ref {
+    fn stops_function(&mut self, stops: &[(f32, Vec<f32>)]) -> Result<Ref, Error> {
         let mut stops = stops.to_vec();
         if stops.len() == 1 {
             stops.push((1.0, stops[0].1.clone()));
@@ -810,31 +974,33 @@ impl Writer {
                 stops[i].0 = stops[i - 1].0 + 1.0e-5;
             }
         }
-        let segments: Vec<Ref> = stops
-            .windows(2)
-            .map(|pair| {
-                let id = self.refs.next();
-                self.pdf
+        let mut segments: Vec<Ref> = Vec::with_capacity(stops.len());
+        for pair in stops.windows(2) {
+            let id = self.refs.next();
+            self.sink.object(|chunk| {
+                chunk
                     .exponential_function(id)
                     .domain([0.0, 1.0])
                     .c0(pair[0].1.iter().copied())
                     .c1(pair[1].1.iter().copied())
                     .n(1.0);
-                id
-            })
-            .collect();
+            })?;
+            segments.push(id);
+        }
         if segments.len() == 1 {
-            return segments[0];
+            return Ok(segments[0]);
         }
         let last = stops.last().map_or(1.0, |s| s.0.max(1.0));
         let id = self.refs.next();
-        self.pdf
-            .stitching_function(id)
-            .domain([0.0, last])
-            .functions(segments.iter().copied())
-            .bounds(stops[1..stops.len() - 1].iter().map(|s| s.0))
-            .encode(segments.iter().flat_map(|_| [0.0, 1.0]));
-        id
+        self.sink.object(|chunk| {
+            chunk
+                .stitching_function(id)
+                .domain([0.0, last])
+                .functions(segments.iter().copied())
+                .bounds(stops[1..stops.len() - 1].iter().map(|s| s.0))
+                .encode(segments.iter().flat_map(|_| [0.0, 1.0]));
+        })?;
+        Ok(id)
     }
 
     /// Returns the index of `font` in `self.fonts`, adding it on first use.
@@ -991,71 +1157,83 @@ impl Writer {
 
     /// Returns the index of `image` in `self.images`, adding it on first use.
     fn image_index(&mut self, image: &Arc<Image>, smooth: bool) -> usize {
-        if let Some(index) = self
-            .images
+        let address = Arc::as_ptr(image) as usize;
+        if let Some(&(_, _, index)) = self
+            .batch_images
             .iter()
-            .position(|resource| Arc::ptr_eq(&resource.image, image) && resource.smooth == smooth)
+            .find(|&&(a, s, _)| a == address && s == smooth)
         {
             return index;
         }
-        let id = self.refs.next();
-        let name = format!("Im{}", self.images.len());
-        self.images.push(ImageResource {
-            image: image.clone(),
-            id,
-            name,
-            smooth,
-        });
-        self.images.len() - 1
+        let key = ImageKey::of(image, smooth);
+        let index = match self.image_keys.get(&key) {
+            Some(&index) => index,
+            None => {
+                let id = self.refs.next();
+                self.images.push(ImageResource {
+                    pending: Some(image.clone()),
+                    id,
+                    smooth,
+                });
+                self.image_keys.insert(key, self.images.len() - 1);
+                self.images.len() - 1
+            }
+        };
+        self.batch_images.push((address, smooth, index));
+        index
     }
 
     /// Writes an image XObject, with a soft mask for its alpha channel.
-    fn write_image(&mut self, resource: &ImageResource) {
-        let image = &resource.image;
+    fn write_image(&mut self, image: &Image, id: Ref, smooth: bool) -> Result<(), Error> {
         let (width, height) = (image.width as i32, image.height as i32);
         match &image.data {
             ImageData::Jpeg { data, components } => {
-                let mut xobject = self.pdf.image_xobject(resource.id, data);
-                xobject.filter(Filter::DctDecode);
-                xobject.width(width).height(height).bits_per_component(8);
-                xobject.interpolate(resource.smooth);
-                if *components == 1 {
-                    xobject.color_space().device_gray();
-                } else {
-                    xobject.color_space().device_rgb();
-                }
+                self.sink.object(|chunk| {
+                    let mut xobject = chunk.image_xobject(id, data);
+                    xobject.filter(Filter::DctDecode);
+                    xobject.width(width).height(height).bits_per_component(8);
+                    xobject.interpolate(smooth);
+                    if *components == 1 {
+                        xobject.color_space().device_gray();
+                    } else {
+                        xobject.color_space().device_rgb();
+                    }
+                })?;
             }
             ImageData::Pixels {
                 samples,
                 gray,
                 alpha,
             } => {
-                let mask = alpha.as_ref().map(|alpha| {
-                    let id = self.refs.next();
-                    (id, compress_to_vec_zlib(alpha, COMPRESSION_LEVEL))
-                });
+                let mask_id = alpha.as_ref().map(|_| self.refs.next());
                 let data = compress_to_vec_zlib(samples, COMPRESSION_LEVEL);
-                let mut xobject = self.pdf.image_xobject(resource.id, &data);
-                xobject.filter(Filter::FlateDecode);
-                xobject.width(width).height(height).bits_per_component(8);
-                xobject.interpolate(resource.smooth);
-                if *gray {
-                    xobject.color_space().device_gray();
-                } else {
-                    xobject.color_space().device_rgb();
-                }
-                if let Some((id, _)) = &mask {
-                    xobject.s_mask(*id);
-                }
-                xobject.finish();
-                if let Some((id, data)) = &mask {
-                    let mut xobject = self.pdf.image_xobject(*id, data);
+                self.sink.object(|chunk| {
+                    let mut xobject = chunk.image_xobject(id, &data);
                     xobject.filter(Filter::FlateDecode);
                     xobject.width(width).height(height).bits_per_component(8);
-                    xobject.color_space().device_gray();
+                    xobject.interpolate(smooth);
+                    if *gray {
+                        xobject.color_space().device_gray();
+                    } else {
+                        xobject.color_space().device_rgb();
+                    }
+                    if let Some(mask_id) = mask_id {
+                        xobject.s_mask(mask_id);
+                    }
+                })?;
+                drop(data);
+                if let (Some(mask_id), Some(alpha)) = (mask_id, alpha) {
+                    let data = compress_to_vec_zlib(alpha, COMPRESSION_LEVEL);
+                    self.sink.object(|chunk| {
+                        let mut xobject = chunk.image_xobject(mask_id, &data);
+                        xobject.filter(Filter::FlateDecode);
+                        xobject.width(width).height(height).bits_per_component(8);
+                        xobject.color_space().device_gray();
+                    })?;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1158,8 +1336,7 @@ fn write_resources(
     }
     let mut x_objects = resources.x_objects();
     for &index in &used.images {
-        let resource = &images[index];
-        x_objects.pair(Name(resource.name.as_bytes()), resource.id);
+        x_objects.pair(Name(image_name(index).as_bytes()), images[index].id);
     }
     for (name, id) in &used.forms {
         x_objects.pair(Name(name.as_bytes()), *id);
@@ -1187,13 +1364,61 @@ fn ellipse_matrix(shading: &Shading, page_height: f32) -> Option<[f32; 6]> {
     }
 }
 
-/// An image the document uses and its XObject.
+/// An image the file uses and its XObject.
 struct ImageResource {
-    image: Arc<Image>,
+    /// The image, until it is written with the page that uses it first.
+    pending: Option<Arc<Image>>,
     id: Ref,
-    name: String,
     /// Whether viewers smooth the image when they scale it.
     smooth: bool,
+}
+
+/// The resource name of the image at `index` of the session's images.
+fn image_name(index: usize) -> String {
+    format!("Im{index}")
+}
+
+/// What makes two images the same XObject: their size, their kind and a hash of their bytes.
+#[derive(PartialEq, Eq, Hash)]
+struct ImageKey {
+    width: u32,
+    height: u32,
+    smooth: bool,
+    /// How many bytes the image and its alpha channel have.
+    lengths: (usize, usize),
+    /// Two hashes of the bytes, which start from different states.
+    hashes: [u64; 2],
+}
+
+impl ImageKey {
+    fn of(image: &Image, smooth: bool) -> Self {
+        let (kind, bytes, alpha): (u8, &[u8], &[u8]) = match &image.data {
+            ImageData::Jpeg { data, components } => (*components, data, &[]),
+            ImageData::Pixels {
+                samples,
+                gray,
+                alpha,
+            } => (
+                if *gray { 101 } else { 103 },
+                samples,
+                alpha.as_deref().unwrap_or(&[]),
+            ),
+        };
+        let hash = |seed: u8| {
+            let mut hasher = DefaultHasher::new();
+            (seed, kind).hash(&mut hasher);
+            bytes.hash(&mut hasher);
+            alpha.hash(&mut hasher);
+            Hasher::finish(&hasher)
+        };
+        Self {
+            width: image.width,
+            height: image.height,
+            smooth,
+            lengths: (bytes.len(), alpha.len()),
+            hashes: [hash(0), hash(1)],
+        }
+    }
 }
 
 /// The matrix that draws an image's unit square into the rectangle at `(x, y)` of `w` × `h`
