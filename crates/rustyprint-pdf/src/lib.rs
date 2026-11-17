@@ -124,6 +124,20 @@ pub struct Session<W: Write> {
     groups: usize,
     /// How native colors are written.
     palette: Palette,
+    /// The pages that are painted on again before the file ends, by their place in the
+    /// file.
+    later: HashMap<usize, LaterPage>,
+}
+
+/// A page that is written and gets more painted on it before the file ends: the content
+/// stream and the resource dictionary it has by number, which are still to be written.
+struct LaterPage {
+    content_id: Ref,
+    resources_id: Ref,
+    /// What the page's first content stream uses.
+    used: Resources,
+    /// The page's height in points.
+    height: f32,
 }
 
 /// A bookmark whose target is resolved to a page object.
@@ -264,6 +278,7 @@ impl<W: Write> Session<W> {
             shadings: 0,
             groups: 0,
             palette,
+            later: HashMap::new(),
         })
     }
 
@@ -283,20 +298,65 @@ impl<W: Write> Session<W> {
     /// links they use. The targets of its links and bookmarks are pages of `document`. Its
     /// title and color profiles are not used: those of the [`Setup`] hold for the file.
     pub fn add_pages(&mut self, document: &Document) -> Result<(), Error> {
-        let result = self.write_pages(document);
+        self.add_pages_painted_later(document, &[])
+    }
+
+    /// Writes the pages of `document` as [`Session::add_pages`] does. The pages at `later`,
+    /// counted in `document` from zero, get a second content stream that is not written
+    /// yet: [`Session::paint_later`] writes it, with what is only known at the end of
+    /// the file. Of such a page the session keeps which resources it uses.
+    pub fn add_pages_painted_later(
+        &mut self,
+        document: &Document,
+        later: &[usize],
+    ) -> Result<(), Error> {
+        let result = self.write_pages(document, later);
         // The images of the batch may be gone from memory after it.
         self.batch_images.clear();
         result
     }
 
-    fn write_pages(&mut self, document: &Document) -> Result<(), Error> {
+    /// Paints `items` on the page at `page`, counted in the file from zero, over what it
+    /// has. The page is one that [`Session::add_pages_painted_later`] left open, and this
+    /// closes it: another call for the same page paints nothing.
+    pub fn paint_later(&mut self, page: usize, items: &[DisplayItem]) -> Result<(), Error> {
+        let Some(later) = self.later.remove(&page) else {
+            return Ok(());
+        };
+        let result = self.write_later(later, items);
+        self.batch_images.clear();
+        result
+    }
+
+    fn write_later(&mut self, later: LaterPage, items: &[DisplayItem]) -> Result<(), Error> {
+        let mut content = Content::new();
+        let mut used = later.used;
+        self.render(&mut content, &mut used, items, later.height)?;
+        self.write_streams(vec![(later.content_id, content.finish().into_vec())], 1)?;
+        self.sink.object(|chunk| {
+            let mut resources = chunk
+                .indirect(later.resources_id)
+                .start::<pdf_writer::writers::Resources>();
+            write_resources(
+                &mut resources,
+                &used,
+                &self.fonts,
+                &self.alphas,
+                &self.images,
+                &self.palette,
+            );
+        })?;
+        self.write_images()
+    }
+
+    fn write_pages(&mut self, document: &Document, later: &[usize]) -> Result<(), Error> {
         // Links can point to a later page of the batch, so its pages take their IDs first.
         let batch: Vec<Ref> = document.pages.iter().map(|_| self.refs.next()).collect();
         // Content streams are compressed in parallel, a batch of pages at a time, and written
         // after their pages under the IDs taken in page order.
         let threads = compression_threads();
         let mut pending: Vec<(Ref, Vec<u8>)> = Vec::new();
-        for (page, &page_id) in document.pages.iter().zip(&batch) {
+        for (index, (page, &page_id)) in document.pages.iter().zip(&batch).enumerate() {
             rustyprint_dom::budget::check_deadline();
             if pending.len() >= threads * PAGES_PER_THREAD {
                 self.write_streams(std::mem::take(&mut pending), threads)?;
@@ -319,13 +379,18 @@ impl<W: Write> Session<W> {
             // the bleed and the marks.
             let extent = bleed + if marked { MARKS_AREA } else { 0.0 };
             let link_ids: Vec<Ref> = page.links.iter().map(|_| self.refs.next()).collect();
+            // A page that is painted on later has a second stream, and its resources are
+            // an object of their own, written with that stream.
+            let open = later
+                .contains(&index)
+                .then(|| (self.refs.next(), self.refs.next()));
             self.sink.object(|chunk| {
                 let mut page_writer = chunk.page(page_id);
                 // The contents are an array, so that a page can get more streams than one.
                 page_writer
                     .parent(self.page_tree_id)
                     .media_box(Rect::new(-extent, -extent, width + extent, height + extent))
-                    .contents_array([content_id]);
+                    .contents_array(std::iter::once(content_id).chain(open.map(|(id, _)| id)));
                 if extent > 0.0 {
                     page_writer
                         .bleed_box(Rect::new(-bleed, -bleed, width + bleed, height + bleed))
@@ -337,17 +402,31 @@ impl<W: Write> Session<W> {
                 if !link_ids.is_empty() {
                     page_writer.annotations(link_ids.iter().copied());
                 }
-                write_resources(
-                    &mut page_writer.resources(),
-                    &used,
-                    &self.fonts,
-                    &self.alphas,
-                    &self.images,
-                    &self.palette,
-                );
+                match open {
+                    Some((_, resources_id)) => {
+                        page_writer.pair(Name(b"Resources"), resources_id);
+                    }
+                    None => write_resources(
+                        &mut page_writer.resources(),
+                        &used,
+                        &self.fonts,
+                        &self.alphas,
+                        &self.images,
+                        &self.palette,
+                    ),
+                }
             })?;
             self.write_links(document, &batch, page, &link_ids)?;
             self.write_images()?;
+            if let Some((content_id, resources_id)) = open {
+                let later = LaterPage {
+                    content_id,
+                    resources_id,
+                    used,
+                    height,
+                };
+                self.later.insert(self.page_ids.len(), later);
+            }
             self.page_ids.push(page_id);
         }
         self.write_streams(pending, threads)?;
@@ -367,8 +446,16 @@ impl<W: Write> Session<W> {
     }
 
     /// Writes what the whole file shares (the outline, the fonts, the page tree and the
-    /// catalog) and the cross-reference table, and returns the writer.
+    /// catalog) and the cross-reference table, and returns the writer. A page that was to
+    /// be painted on later and was not is closed as it is.
     pub fn finish(mut self) -> Result<W, Error> {
+        // A page that was to be painted on later and was not has nothing more on it.
+        let mut open: Vec<usize> = self.later.keys().copied().collect();
+        open.sort_unstable();
+        for page in open {
+            self.paint_later(page, &[])?;
+        }
+
         let outline_id = if self.outline.is_empty() {
             None
         } else {

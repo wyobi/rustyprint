@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use rustyprint_css::StyleOptions;
 use rustyprint_dom::Document;
 use rustyprint_dom::budget::{self, Budget, Exceeded};
-use rustyprint_layout::{ImageCache, Images, PageOptions};
+use rustyprint_layout::{DeferredMargins, ImageCache, Images, LaterTotal, PageOptions};
 
 pub use assets::Assets;
 pub use options::{page_size, parse_length, parse_margin};
@@ -317,7 +317,18 @@ struct Preceding<'a> {
     pages: usize,
     /// The images those records share.
     images: Option<&'a ImageCache>,
+    /// That `counter(pages)` is the number of pages of the set, known when it ends.
+    total: Option<&'a LaterTotal>,
 }
+
+/// A laid-out document: what its pages paint, the warnings of laying it out, and for a
+/// record of a set the margin boxes that wait for the number of pages, by page of the
+/// document from zero.
+type LaidOut = (
+    rustyprint_layout::display::Document,
+    Vec<String>,
+    Vec<(usize, DeferredMargins)>,
+);
 
 fn panic_message(panic: &(dyn Any + Send)) -> String {
     let message = panic
@@ -373,7 +384,8 @@ fn lay_out(
     html: &str,
     options: &RenderOptions,
 ) -> Result<(rustyprint_layout::display::Document, Vec<String>), Error> {
-    lay_out_after(html, options, &Preceding::default())
+    let (document, warnings, _) = lay_out_after(html, options, &Preceding::default())?;
+    Ok((document, warnings))
 }
 
 /// Lays a document out as [`lay_out`] does, after what `preceding` says comes before it.
@@ -381,7 +393,7 @@ fn lay_out_after(
     html: &str,
     options: &RenderOptions,
     preceding: &Preceding,
-) -> Result<(rustyprint_layout::display::Document, Vec<String>), Error> {
+) -> Result<LaidOut, Error> {
     #[cfg(feature = "test-support")]
     if html.contains("<!--rustyprint:panic-->") {
         panic!("rustyprint:panic comment in the document");
@@ -434,6 +446,7 @@ fn lay_out_after(
             &page,
             &images,
             preceding.pages,
+            preceding.total,
         );
         (styles, pages)
     };
@@ -457,7 +470,12 @@ fn lay_out_after(
     if options.title.is_some() {
         laid_out.title = options.title.clone();
     }
-    Ok((laid_out, warnings))
+    let deferred = pages
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, page)| Some((index, page.deferred.take()?)))
+        .collect();
+    Ok((laid_out, warnings, deferred))
 }
 
 #[cfg(test)]

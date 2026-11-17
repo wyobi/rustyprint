@@ -15,7 +15,7 @@ use crate::boxes::BlockBox;
 use crate::display::{Rect, Size};
 use crate::flow::{self, BreakToken, Fragmentainer};
 use crate::fragment::{BoxFragment, Fragment, Sides};
-use crate::margins::MarginBoxFragment;
+use crate::margins::{DeferredMargins, MarginBoxFragment};
 
 /// More pages than any document should need, in case layout stops making progress.
 const MAX_PAGES: usize = 100_000;
@@ -39,6 +39,9 @@ pub struct LaidPage {
     pub root: Option<BoxFragment>,
     /// The margin boxes, positioned in page coordinates.
     pub margin_boxes: Vec<MarginBoxFragment>,
+    /// The margin boxes that wait for the number of pages of a set, on a page of one that
+    /// has such boxes.
+    pub deferred: Option<DeferredMargins>,
 }
 
 impl LaidPage {
@@ -273,5 +276,6 @@ fn setup(styles: &Styles, defaults: &PageOptions, key: PageKey) -> LaidPage {
         area,
         root: None,
         margin_boxes: Vec::new(),
+        deferred: None,
     }
 }

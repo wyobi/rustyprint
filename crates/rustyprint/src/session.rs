@@ -7,13 +7,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use rustyprint_dom::budget;
-use rustyprint_layout::ImageCache;
 use rustyprint_layout::display::{ColorProfile, Document};
+use rustyprint_layout::{DeferredMargins, ImageCache, Images, LaterTotal};
 use rustyprint_pdf::{Session, Setup};
 
 use crate::{
-    Error, Limit, Limits, Preceding, RenderOptions, STACK_SIZE, budget_of, check_input_size,
-    check_scale, exceeded, lay_out_after, limit_error, panic_message,
+    Error, Limit, Limits, Preceding, RenderOptions, STACK_SIZE, assets, budget_of,
+    check_input_size, check_scale, exceeded, lay_out_after, limit_error, panic_message,
 };
 
 /// The decoded pixels a set keeps, at the most, of the images that its records share.
@@ -59,7 +59,15 @@ pub struct Summary {
 /// - Every record starts on a new page, and its first page is a `:first` page.
 /// - Page numbers run through the set: `counter(page)` on the first page of a record is
 ///   one more than the pages before it, and left and right pages carry on as well.
-/// - `counter(pages)` is the number of pages of the record, not of the set.
+/// - `counter(pages)` in a page's margin is the number of pages of the whole set. It is
+///   known when the set is finished, so a margin box that shows it is painted then, on a
+///   page that is already written; until then the set keeps the style, number and size of
+///   every such page, and nothing of what is on it. A box beside it on the same edge
+///   waits with it when its place depends on how wide the total is; if that box shows a
+///   running element or an image, the set keeps that as well. Relative URLs in the style
+///   of a box that waits are loaded without the record's `<base>`.
+///   `target-counter(url, pages)` in a record's content counts the record's own pages,
+///   with a warning.
 /// - Links and `target-counter()` reach inside a record only: a link to an element of
 ///   another record does not resolve.
 /// - The file's title is [`RenderOptions::title`], or else the `<title>` of the first
@@ -253,6 +261,9 @@ struct Printer {
     /// The color profiles the file was started with: those of the first record.
     color_profiles: Vec<ColorProfile>,
     device_cmyk: Option<u32>,
+    total: LaterTotal,
+    /// The margin boxes that wait for the number of pages, by page of the file from zero.
+    deferred: Vec<(usize, DeferredMargins)>,
 }
 
 impl Printer {
@@ -263,6 +274,8 @@ impl Printer {
             session: None,
             color_profiles: Vec::new(),
             device_cmyk: None,
+            total: LaterTotal::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -305,19 +318,28 @@ impl Printer {
         let preceding = Preceding {
             pages: before,
             images: Some(&self.images),
+            total: Some(&self.total),
         };
-        let (record, warnings) = lay_out_after(html, &self.options, &preceding)?;
+        let (record, warnings, deferred) = lay_out_after(html, &self.options, &preceding)?;
         let pages = record.pages.len();
         let max = self.options.limits.max_total_pages;
         if before + pages > max {
             return Err(exceeded(Limit::TotalPages, max));
         }
+        let later: Vec<usize> = deferred.iter().map(|(page, _)| *page).collect();
         let session = self.session_for(&record)?;
-        session.add_pages(&record).map_err(internal)?;
+        session
+            .add_pages_painted_later(&record, &later)
+            .map_err(internal)?;
+        let bytes = std::mem::take(session.get_mut());
+        let deferred = deferred
+            .into_iter()
+            .map(|(page, margins)| (before + page, margins));
+        self.deferred.extend(deferred);
         Ok(Written {
             pages,
             warnings,
-            bytes: std::mem::take(session.get_mut()),
+            bytes,
         })
     }
 
@@ -346,7 +368,7 @@ impl Printer {
     }
 
     fn finish(&mut self) -> Result<Written, Error> {
-        let session = match self.session.take() {
+        let mut session = match self.session.take() {
             Some(session) => session,
             None => {
                 let setup = Setup {
@@ -356,11 +378,31 @@ impl Printer {
                 Session::new(Vec::new(), setup).map_err(internal)?
             }
         };
+        self.paint_deferred(&mut session)?;
         Ok(Written {
             pages: 0,
             warnings: Vec::new(),
             bytes: session.finish().map_err(internal)?,
         })
+    }
+}
+
+impl Printer {
+    /// Paints the margin boxes that waited for the number of pages, now that the file
+    /// has all of them, each on its page.
+    fn paint_deferred(&mut self, session: &mut Session<Vec<u8>>) -> Result<(), Error> {
+        let total = session.page_count();
+        let loader = assets::Loader::new(&self.options.assets);
+        let load_file = |url: &str| loader.get(url);
+        let images = Images::new(&load_file)
+            .with_max_pixels(self.options.limits.max_image_pixels)
+            .with_cache(&self.images);
+        for (page, margins) in std::mem::take(&mut self.deferred) {
+            budget::check_deadline();
+            let items = rustyprint_layout::paint_deferred_margins(&margins, total, &images);
+            session.paint_later(page, &items).map_err(internal)?;
+        }
+        Ok(())
     }
 }
 

@@ -297,6 +297,8 @@ pub struct Built {
     /// Whether the content uses `target-*()`, so that layout has to run again once the
     /// pages are known.
     pub uses_targets: bool,
+    /// Whether the content shows the number of pages, with `target-counter(url, pages)`.
+    pub uses_total: bool,
 }
 
 /// An element taken out of the flow by `position: running(name)`, for `element(name)` in
@@ -341,6 +343,7 @@ pub fn build_with_targets(
         previous: targets,
         targets: HashMap::new(),
         uses_targets: false,
+        uses_total: false,
         legends: Vec::new(),
     };
     builder.counters.enter();
@@ -354,6 +357,7 @@ pub fn build_with_targets(
         running: builder.running,
         targets: builder.targets,
         uses_targets: builder.uses_targets,
+        uses_total: builder.uses_total,
     })
 }
 
@@ -385,6 +389,7 @@ struct Builder<'a> {
     previous: &'a Targets,
     targets: HashMap<NodeId, Target>,
     uses_targets: bool,
+    uses_total: bool,
     /// The rendered legends of the fieldsets being built, innermost last, with their boxes
     /// once built.
     legends: Vec<(NodeId, Option<BlockBox>)>,
@@ -1931,7 +1936,10 @@ impl Builder<'_> {
         let previous = self.previous.elements.get(&node);
         let values = match name {
             "page" => previous.and_then(|t| t.page).map(|p| vec![p as i32]),
-            "pages" => Some(vec![self.previous.pages as i32]),
+            "pages" => {
+                self.uses_total = true;
+                Some(vec![self.previous.pages as i32])
+            }
             _ => known.and_then(|t| t.counters.get(name).cloned()),
         };
         values.unwrap_or_else(|| vec![0])

@@ -80,7 +80,15 @@ fn a_set_holds_no_pixels_of_the_records_it_printed() {
     checked.add(&record(RECORDS)).unwrap();
     assert_eq!(common::image_count(&checked.finish().unwrap().0), 1);
 
-    let mut set = RecordSet::open(std::io::sink(), &RenderOptions::default()).unwrap();
+    // Every page waits for the page count of the set, and still holds nothing of its record.
+    let options = RenderOptions {
+        stylesheet: Some(
+            "@page { @bottom-right { content: 'Page ' counter(page) ' of ' counter(pages) } }"
+                .to_owned(),
+        ),
+        ..RenderOptions::default()
+    };
+    let mut set = RecordSet::open(std::io::sink(), &options).unwrap();
     // The first record loads the fonts, which stay for the whole set.
     set.add("<p>Record</p>").unwrap();
     let before = resident_kb();
@@ -99,4 +107,5 @@ fn a_set_holds_no_pixels_of_the_records_it_printed() {
     );
     let (_, summary) = set.finish().unwrap();
     assert_eq!(summary.records, RECORDS + 1);
+    assert!(summary.pages > RECORDS);
 }

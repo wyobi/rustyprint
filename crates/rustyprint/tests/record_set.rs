@@ -79,9 +79,8 @@ fn records_added_one_by_one_are_one_file_with_pages_numbered_through() {
     }
 
     for (index, text) in texts.iter().enumerate() {
-        // `counter(page)` runs through the set; `counter(pages)` is the record's own.
-        let record = starts.iter().rposition(|&start| start <= index).unwrap();
-        let folio = format!("folio{}of{}end", index + 1, added[record]);
+        // `counter(page)` runs through the set, and `counter(pages)` is the pages of the set.
+        let folio = format!("folio{}of{total}end", index + 1);
         assert!(text.contains(&folio), "page {}: {text:?}", index + 1);
         // Left and right pages carry on through the set: the first page is a right page.
         let side = if index % 2 == 0 {
@@ -268,4 +267,203 @@ fn a_set_goes_to_another_thread_and_is_dropped_unfinished_without_hanging() {
     });
     done.recv_timeout(Duration::from_secs(30))
         .expect("the sets are dropped");
+}
+
+/// How many content streams each page of a PDF file has.
+fn content_streams(pdf: &[u8]) -> Vec<usize> {
+    let document = lopdf::Document::load_mem(pdf).expect("valid PDF");
+    let pages = document.get_pages();
+    pages
+        .values()
+        .map(|&id| document.get_page_contents(id).len())
+        .collect()
+}
+
+/// The text of each page from its last `word` on, without its white space.
+fn from_word(pdf: &[u8], word: &str) -> Vec<String> {
+    page_texts(pdf)
+        .iter()
+        .map(|text| {
+            let text: String = text.split_whitespace().collect();
+            let at = text.rfind(word).unwrap_or(text.len());
+            text[at..].to_owned()
+        })
+        .collect()
+}
+
+const PAGE_OF_PAGES: &str =
+    r#"@page { @bottom-right { content: "Page " counter(page) " of " counter(pages) } }"#;
+
+fn with_stylesheet(stylesheet: &str) -> RenderOptions {
+    RenderOptions {
+        stylesheet: Some(stylesheet.to_owned()),
+        ..RenderOptions::default()
+    }
+}
+
+/// Four records of one, several, two and many pages.
+fn four_records() -> [String; 4] {
+    [
+        "<h1>Alpha record</h1>".to_owned(),
+        format!("<h1>Bravo record</h1>{}", paragraphs(60)),
+        format!("<h1>Charlie record</h1>{}", paragraphs(25)),
+        format!("<h1>Delta record</h1>{}", paragraphs(130)),
+    ]
+}
+
+#[test]
+fn the_page_count_in_a_margin_is_that_of_the_whole_set() {
+    let options = with_stylesheet(PAGE_OF_PAGES);
+    let records = four_records();
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    let mut added = Vec::new();
+    let mut file = Vec::new();
+    for record in &records {
+        let record_added = set.add(record).unwrap();
+        assert_eq!(record_added.warnings, Vec::<String>::new());
+        added.push(record_added.pages);
+        // The pages are written with their record, before the total is known.
+        let part = std::mem::take(set.writer_mut());
+        let written = part
+            .windows(9)
+            .filter(|bytes| bytes == b"/Contents")
+            .count();
+        assert_eq!(written, record_added.pages, "page objects in the writer");
+        file.extend(part);
+    }
+    let mut lengths = added.clone();
+    lengths.sort_unstable();
+    lengths.dedup();
+    assert_eq!(lengths.len(), 4, "the records have {added:?} pages");
+    let (rest, summary) = set.finish().unwrap();
+    let pdf = [file, rest].concat();
+    let total = summary.pages;
+    assert_eq!(total, added.iter().sum::<usize>());
+    assert!(total >= 10, "the total of {total} has two digits");
+
+    let expected: Vec<String> = (1..=total).map(|k| format!("Page{k}of{total}")).collect();
+    assert_eq!(from_word(&pdf, "Page"), expected);
+    // Every page has the stream of its footer after its own.
+    assert_eq!(content_streams(&pdf), vec![2; total]);
+
+    // The same records as one document, each from a new page, have the same footers.
+    let whole: String = records
+        .iter()
+        .map(|record| format!("<div style='break-before: page'>{record}</div>"))
+        .collect();
+    let rendered = render(&whole, &options).unwrap().pdf;
+    assert_eq!(from_word(&rendered, "Page"), expected);
+    // There the total is known from the start, and nothing waits for it.
+    assert_eq!(content_streams(&rendered), vec![1; total]);
+}
+
+#[test]
+fn only_a_page_that_shows_the_page_count_gets_a_second_stream() {
+    let print = |stylesheet: &str| {
+        let mut set = RecordSet::open(Vec::new(), &with_stylesheet(stylesheet)).unwrap();
+        let mut starts = Vec::new();
+        for record in &four_records() {
+            starts.push(set.pages());
+            set.add(record).unwrap();
+        }
+        (set.finish().unwrap().0, starts)
+    };
+    // Without the page count nothing waits.
+    let (pdf, _) = print("@page { @bottom-right { content: 'Page ' counter(page) } }");
+    let total = page_count(&pdf);
+    assert_eq!(content_streams(&pdf), vec![1; total]);
+    let expected: Vec<String> = (1..=total).map(|k| format!("Page{k}")).collect();
+    assert_eq!(from_word(&pdf, "Page"), expected);
+
+    // With it on first pages alone, only those wait, and the others show their number
+    // as before.
+    let (pdf, starts) = print(
+        "@page { @bottom-right { content: 'Page ' counter(page) } }
+         @page :first { @bottom-right { content: 'Page ' counter(page) ' of ' counter(pages) } }",
+    );
+    let streams: Vec<usize> = (0..total)
+        .map(|page| if starts.contains(&page) { 2 } else { 1 })
+        .collect();
+    assert_eq!(content_streams(&pdf), streams);
+    let expected: Vec<String> = (0..total)
+        .map(|page| match starts.contains(&page) {
+            true => format!("Page{}of{total}", page + 1),
+            false => format!("Page{}", page + 1),
+        })
+        .collect();
+    assert_eq!(from_word(&pdf, "Page"), expected);
+}
+
+#[test]
+fn left_and_right_pages_show_their_own_page_count_footer() {
+    let options = with_stylesheet(
+        "@page :left { @bottom-left { content: 'Verso ' counter(pages) ' has ' counter(page) } }
+         @page :right { @bottom-right { content: 'Recto ' counter(page) ' in ' counter(pages) } }",
+    );
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for record in &four_records() {
+        set.add(record).unwrap();
+    }
+    let (pdf, summary) = set.finish().unwrap();
+    let total = summary.pages;
+    let texts = page_texts(&pdf);
+    assert_eq!(texts.len(), total);
+    for (index, text) in texts.iter().enumerate() {
+        let text: String = text.split_whitespace().collect();
+        let number = index + 1;
+        // The first page of the set is a right page.
+        let (shown, other) = match index % 2 {
+            0 => (format!("Recto{number}in{total}"), "Verso"),
+            _ => (format!("Verso{total}has{number}"), "Recto"),
+        };
+        assert!(text.ends_with(&shown), "page {number}: {text:?}");
+        assert!(!text.contains(other), "page {number}: {text:?}");
+    }
+}
+
+#[test]
+fn a_running_element_beside_the_page_count_is_kept_for_it() {
+    // The two boxes share the bottom edge by what each holds, so the running element
+    // waits for the total as well.
+    let options = with_stylesheet(
+        "@page {
+            @bottom-left { content: element(footer) }
+            @bottom-right { content: 'Sheet ' counter(page) ' of ' counter(pages) }
+            @top-center { content: 'Heading' counter(page) }
+         }
+         .footer { position: running(footer) }",
+    );
+    let records = four_records();
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    let mut owners = Vec::new();
+    for (name, record) in ["Alpha", "Bravo", "Charlie", "Delta"]
+        .into_iter()
+        .zip(&records)
+    {
+        let html = format!("<div class='footer'>Statement{name}</div>{record}");
+        let added = set.add(&html).unwrap();
+        owners.extend(std::iter::repeat_n(name, added.pages));
+    }
+    let (pdf, summary) = set.finish().unwrap();
+    let total = summary.pages;
+    let texts = page_texts(&pdf);
+    assert_eq!(texts.len(), total);
+    for (index, text) in texts.iter().enumerate() {
+        let text: String = text.split_whitespace().collect();
+        let number = index + 1;
+        assert!(
+            text.contains(&format!("Statement{}", owners[index])),
+            "page {number}: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("Sheet{number}of{total}")),
+            "page {number}: {text:?}"
+        );
+        // The box of another edge is painted with its page.
+        assert!(
+            text.contains(&format!("Heading{number}")),
+            "page {number}: {text:?}"
+        );
+    }
+    assert_eq!(content_streams(&pdf), vec![2; total]);
 }

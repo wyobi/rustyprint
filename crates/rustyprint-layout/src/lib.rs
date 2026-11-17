@@ -52,7 +52,7 @@ pub use font::{Font, FontError, VerticalMetrics};
 pub use fonts::{FontChoice, font_metrics, select, select_font};
 pub use fragment::{Sides, Turn};
 pub use images::{Image, ImageCache, ImageData, Images};
-pub use margins::MarginBoxFragment;
+pub use margins::{DeferredMargins, LaterTotal, MarginBoxFragment};
 pub use paginate::LaidPage;
 pub use text::{Glyph, shape};
 
@@ -171,6 +171,7 @@ fn paginated(
                     running: Vec::new(),
                     targets: Default::default(),
                     uses_targets: false,
+                    uses_total: false,
                 }
             });
         let pages = paginate::pages(&built.root, styles, page, before);
@@ -200,22 +201,35 @@ pub fn layout_pages(
     page: &PageOptions,
     images: &Images,
 ) -> Vec<LaidPage> {
-    layout_pages_after(document, styles, page, images, 0)
+    layout_pages_after(document, styles, page, images, 0, None)
 }
 
 /// Lays out a styled document as [`layout_pages`] does, as a document that comes after
 /// `before` pages already laid out, such as one record of a set that is printed as one
 /// file: its page numbers and its left and right pages carry on from them. Its first page
-/// is still a `:first` page, and `counter(pages)` is still the number of its own pages.
+/// is still a `:first` page.
+///
+/// `counter(pages)` is the number of the document's own pages. With `later`, it is the
+/// number of pages of the whole set instead, which is known when the set ends: a page
+/// whose margin boxes show it gets them as [`LaidPage::deferred`], for
+/// [`paint_deferred_margins`], and they are not among its margin boxes.
+/// `target-counter(url, pages)` in the content still counts the document's own pages, with
+/// a warning.
 pub fn layout_pages_after(
     document: &Document,
     styles: &Styles,
     page: &PageOptions,
     images: &Images,
     before: usize,
+    later: Option<&LaterTotal>,
 ) -> Vec<LaidPage> {
     inline::set_quirks(document.quirks_mode() != rustyprint_dom::QuirksMode::NoQuirks);
     let (built, mut pages) = paginated(document, styles, page, images, before);
+    if later.is_some() && built.uses_total {
+        images.warn(
+            "target-counter(…, pages) counts the pages of its own record, not of the set".into(),
+        );
+    }
     let running = built.running;
     let order = document
         .descendants(document.root())
@@ -229,8 +243,25 @@ pub fn layout_pages_after(
         &styles.counter_styles,
         images,
         before,
+        later,
     );
     pages
+}
+
+/// What the margin boxes that waited for the number of pages paint, on their page of a
+/// set of `total` pages.
+pub fn paint_deferred_margins(
+    deferred: &DeferredMargins,
+    total: usize,
+    images: &Images,
+) -> Vec<DisplayItem> {
+    let size = deferred.size();
+    let sheet = Rect::new(0.0, 0.0, size.width, size.height);
+    let mut items = Vec::new();
+    for margin_box in deferred.lay_out(total) {
+        items.extend(paint::paint(&margin_box.fragment, images, sheet).items);
+    }
+    effects::resolve_backdrops(items)
 }
 
 /// The link areas of each laid-out page, and the document's bookmarks from its headings.

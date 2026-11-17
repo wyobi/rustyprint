@@ -392,7 +392,7 @@ struct Resolved {
 }
 
 /// The counter styles of a document: the predefined ones and its `@counter-style` rules.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CounterStyles {
     rules: HashMap<Arc<str>, Descriptors>,
     /// The URLs of the rules' image symbols.
