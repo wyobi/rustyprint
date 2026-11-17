@@ -27,6 +27,7 @@ fn style_with(html: &str, extra: Option<&str>, files: &[(&str, &str)]) -> (Docum
             media_size: PAGE,
             zoom: 1.0,
             stylesheet: extra,
+            parsed_stylesheet: None,
             load: &load,
             font_metrics: None,
             load_font: None,

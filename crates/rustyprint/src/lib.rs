@@ -15,11 +15,12 @@ mod session;
 
 use std::any::Any;
 use std::fmt;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustyprint_css::StyleOptions;
+use rustyprint_css::stylesheet::Stylesheet;
 use rustyprint_dom::Document;
 use rustyprint_dom::budget::{self, Budget, Exceeded};
 use rustyprint_layout::{DeferredMargins, ImageCache, Images, LaterTotal, PageOptions};
@@ -319,6 +320,10 @@ struct Preceding<'a> {
     images: Option<&'a ImageCache>,
     /// That `counter(pages)` is the number of pages of the set, known when it ends.
     total: Option<&'a LaterTotal>,
+    /// The font files those records loaded.
+    fonts: Option<&'a assets::FontFiles>,
+    /// The stylesheet of the options, parsed when the set was opened.
+    stylesheet: Option<&'a Stylesheet>,
 }
 
 /// A laid-out document: what its pages paint, the warnings of laying it out, and for a
@@ -355,7 +360,7 @@ fn content_width_on_this_thread(html: &str, window: Size, options: &RenderOption
         None => loader.get(url),
     };
     let load = |url: &str| get(url).and_then(|bytes| String::from_utf8(bytes).ok());
-    let load_font = |url: &str| get(url);
+    let load_font = |url: &str| get(url).map(Arc::from);
     let load_file = |url: &str| get(url);
     let images = Images::new(&load_file).with_max_pixels(options.limits.max_image_pixels);
     let styles = rustyprint_layout::style(
@@ -365,6 +370,7 @@ fn content_width_on_this_thread(html: &str, window: Size, options: &RenderOption
             media_size: (window.width, window.height),
             zoom: 1.0,
             stylesheet: options.stylesheet.as_deref(),
+            parsed_stylesheet: None,
             load: &load,
             font_metrics: Some(&rustyprint_layout::font_metrics),
             load_font: Some(&load_font),
@@ -443,7 +449,16 @@ fn lay_out_flow(
         None => loader.get(url),
     };
     let load = |url: &str| get(url).and_then(|bytes| String::from_utf8(bytes).ok());
-    let load_font = |url: &str| get(url);
+    // The records of a set share the files of their fonts, which makes each one font of
+    // the file however many records use it.
+    let load_font = |url: &str| match (preceding.fonts, &base) {
+        (Some(fonts), Some(base)) => {
+            let url = rustyprint_dom::resolve_url(base, url);
+            fonts.load(&url, || loader.get(&url))
+        }
+        (Some(fonts), None) => fonts.load(url, || loader.get(url)),
+        (None, _) => get(url).map(Arc::from),
+    };
     let load_file = |url: &str| get(url);
     let images = Images::new(&load_file).with_max_pixels(options.limits.max_image_pixels);
     let images = match preceding.images {
@@ -461,7 +476,11 @@ fn lay_out_flow(
                 page_size: (area.width, area.height),
                 media_size: (area.width / scale, area.height / scale),
                 zoom,
-                stylesheet: options.stylesheet.as_deref(),
+                stylesheet: match preceding.stylesheet {
+                    Some(_) => None,
+                    None => options.stylesheet.as_deref(),
+                },
+                parsed_stylesheet: preceding.stylesheet,
                 load: &load,
                 font_metrics: Some(&rustyprint_layout::font_metrics),
                 load_font: Some(&load_font),

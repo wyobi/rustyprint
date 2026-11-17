@@ -5,7 +5,7 @@ mod common;
 
 use std::ops::Range;
 
-use common::{page_count, paragraphs};
+use common::{font_count, page_count, paragraphs, web_fonts};
 use lopdf::Object;
 use lopdf::content::Content;
 use rustyprint::{Error, RecordSet, RenderOptions, render};
@@ -264,6 +264,36 @@ fn a_table_a_row_at_a_time_prints_as_the_whole_table() {
         row: uneven_row,
     };
     assert_pieces_print_as_whole(&shape, 90, 1);
+}
+
+#[test]
+fn the_web_fonts_of_a_table_in_pieces_are_embedded_once() {
+    fn row(index: usize) -> String {
+        format!(
+            "<tr><td>{index}</td><td>Row <b>number</b> {index}</td><td>{}.00</td></tr>",
+            index * 7
+        )
+    }
+    let shape = Shape {
+        style: FIXED.style,
+        top: FIXED.top,
+        row,
+    };
+    let options = RenderOptions {
+        stylesheet: Some(web_fonts()),
+        ..RenderOptions::default()
+    };
+    let whole = render(&shape.whole(4000), &options).unwrap();
+    assert_eq!(whole.warnings, Vec::<String>::new());
+    // The regular and the bold.
+    assert_eq!(font_count(&whole.pdf), 2);
+
+    let pieces = print_pieces(&shape.pieces(4000, 50), &options);
+    assert_eq!(page_count(&pieces), page_count(&whole.pdf));
+    assert_eq!(font_count(&pieces), 2);
+    // A set writes the resources of every page as an object of their own.
+    let ratio = pieces.len() as f64 / whole.pdf.len() as f64;
+    assert!(ratio < 1.15, "{ratio} times the whole print");
 }
 
 #[test]

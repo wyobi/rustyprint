@@ -6,6 +6,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use rustyprint_css::stylesheet::Stylesheet;
 use rustyprint_dom::{NodeData, NodeId, budget, local_name};
 use rustyprint_layout::display::{ColorProfile, Document};
 use rustyprint_layout::{Carried, DeferredMargins, ImageCache, Images, LaterTotal};
@@ -78,7 +79,11 @@ pub struct Summary {
 /// - The file's title is [`RenderOptions::title`], or else the `<title>` of the first
 ///   record. Its color profiles are those of the first record, and a record with other
 ///   `@color-profile` rules fails.
-/// - Fonts are loaded once and embedded once. An image is written to the file once
+/// - Fonts are loaded once and embedded once: the bundled ones, and those of `@font-face`
+///   rules, whose files are told apart by their bytes, so the font of a rule in every
+///   record is one font of the file. The set keeps up to 64 MB of font files, with the
+///   ones used the longest ago let go first; a font used again after that is embedded
+///   again. The stylesheet of the options is parsed once. An image is written to the file once
 ///   however many records use it. Decoded images are kept between records only once a
 ///   second record uses the same file, up to 64 MB of pixels with the ones used the
 ///   longest ago let go first, so a logo is decoded twice and a record's own photo is
@@ -259,8 +264,9 @@ struct Written {
 }
 
 /// The thread that lays the records out and writes them. Fonts are cached per thread and
-/// told apart by where they are in memory, so one thread prints every record of a set:
-/// that is what embeds a font once for the whole file.
+/// told apart by where they are in memory, so one thread prints every record of a set and
+/// keeps the font files the records load: that is what embeds a font once for the whole
+/// file.
 struct Worker {
     /// `None` once the thread is told to stop.
     work: Option<Sender<Work>>,
@@ -310,12 +316,16 @@ impl Drop for Worker {
     }
 }
 
-/// What the thread of a set holds between records: the options, the images that records
-/// share, and the PDF file being written, which holds the fonts and what tells the
+/// What the thread of a set holds between records: the options, the images and the font
+/// files that records share, and the PDF file being written, which holds the fonts and what tells the
 /// images written apart, and none of the pages.
 struct Printer {
     options: RenderOptions,
+    /// The stylesheet of the options, parsed once for every record.
+    stylesheet: Option<Stylesheet>,
     images: ImageCache,
+    /// The font files the records loaded, each of them once.
+    fonts: assets::FontFiles,
     /// The file, from the first record on. It is written to memory, a record at a time,
     /// and the set hands each record's bytes to its writer.
     session: Option<Session<Vec<u8>>>,
@@ -342,8 +352,10 @@ struct Flow {
 impl Printer {
     fn new(options: RenderOptions) -> Self {
         Self {
+            stylesheet: options.stylesheet.as_deref().map(Stylesheet::parse),
             options,
             images: ImageCache::new(SHARED_IMAGE_BYTES),
+            fonts: assets::FontFiles::default(),
             session: None,
             color_profiles: Vec::new(),
             device_cmyk: None,
@@ -414,6 +426,8 @@ impl Printer {
             pages: before,
             images: Some(&self.images),
             total: Some(&self.total),
+            fonts: Some(&self.fonts),
+            stylesheet: self.stylesheet.as_ref(),
         };
         let kept = carried.as_ref().map(|(carried, fit)| (carried, *fit));
         let LaidFlow {

@@ -3,6 +3,7 @@
 
 mod common;
 
+use common::base64;
 use rustyprint::{RecordSet, RenderOptions};
 
 /// Records printed, each with an image no other record has.
@@ -53,24 +54,6 @@ fn record(number: usize) -> String {
         "<p>Record {number}</p><img src='data:image/bmp;base64,{}'>",
         base64(&bitmap(number))
     )
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let group = chunk.iter().enumerate().fold(0u32, |group, (at, &byte)| {
-            group | u32::from(byte) << (16 - 8 * at)
-        });
-        for digit in 0..4 {
-            if digit <= chunk.len() {
-                text.push(DIGITS[(group >> (18 - 6 * digit)) as usize & 63] as char);
-            } else {
-                text.push('=');
-            }
-        }
-    }
-    text
 }
 
 #[test]

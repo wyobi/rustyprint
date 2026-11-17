@@ -1472,7 +1472,7 @@ impl Builder<'_> {
         let document = Document::parse(&html);
         rustyprint_dom::budget::check_document(&document);
         let load = |url: &str| self.images.text(url);
-        let load_font = |url: &str| self.images.bytes(url);
+        let load_font = |url: &str| self.images.bytes(url).map(Arc::from);
         let styles = compute_styles(
             &document,
             &StyleOptions {
@@ -1480,6 +1480,7 @@ impl Builder<'_> {
                 media_size: viewport,
                 zoom: 1.0,
                 stylesheet: None,
+                parsed_stylesheet: None,
                 load: &load,
                 font_metrics: Some(&crate::font_metrics),
                 load_font: Some(&load_font),
@@ -2450,6 +2451,7 @@ mod tests {
                 media_size: (800.0, 1000.0),
                 zoom: 1.0,
                 stylesheet: None,
+                parsed_stylesheet: None,
                 load: &load,
                 font_metrics: None,
                 load_font: None,

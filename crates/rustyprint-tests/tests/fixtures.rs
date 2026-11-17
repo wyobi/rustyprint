@@ -48,6 +48,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use rustyprint_css::StyleOptions;
@@ -211,7 +212,7 @@ fn run_fixture(path: &Path) -> Result<(), Failed> {
         None => dir.join(url),
     };
     let load = |url: &str| fs::read_to_string(path(url)).ok();
-    let load_font = |url: &str| fs::read(path(url)).ok();
+    let load_font = |url: &str| fs::read(path(url)).ok().map(Arc::from);
     let page = PageOptions {
         size: Size::new(PAGE.0, PAGE.1),
         margin: Sides::default(),
@@ -225,6 +226,7 @@ fn run_fixture(path: &Path) -> Result<(), Failed> {
             media_size: PAGE,
             zoom: 1.0,
             stylesheet: None,
+            parsed_stylesheet: None,
             load: &load,
             font_metrics: Some(&rustyprint_layout::font_metrics),
             load_font: Some(&load_font),

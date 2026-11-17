@@ -35,6 +35,64 @@ pub fn image_count(pdf: &[u8]) -> usize {
         .count()
 }
 
+/// How many fonts the PDF embeds.
+pub fn font_count(pdf: &[u8]) -> usize {
+    let doc = lopdf::Document::load_mem(pdf).expect("valid PDF");
+    doc.objects
+        .values()
+        .filter_map(|object| object.as_dict().ok())
+        .filter(|dict| {
+            dict.get(b"Subtype")
+                .and_then(|s| s.as_name())
+                .is_ok_and(|name| name == b"Type0")
+        })
+        .count()
+}
+
+/// A file of the repository's `fonts` directory.
+pub fn font_file(name: &str) -> Vec<u8> {
+    let fonts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts");
+    std::fs::read(fonts.join(name)).expect("the font is in the repository")
+}
+
+/// An `@font-face` rule for the family `Doc` at `weight`, with the font file `name` as a
+/// `data:` URL.
+pub fn font_face(name: &str, weight: u16) -> String {
+    format!(
+        "@font-face {{ font-family: Doc; font-weight: {weight}; \
+         src: url(data:font/ttf;base64,{}) }}",
+        base64(&font_file(name))
+    )
+}
+
+/// A stylesheet that sets the document in a web font, with its regular and its bold as
+/// `data:` URLs.
+pub fn web_fonts() -> String {
+    format!(
+        "{}{} body {{ font-family: Doc }}",
+        font_face("NotoSansMono-Regular.ttf", 400),
+        font_face("NotoSansMono-Bold.ttf", 700)
+    )
+}
+
+pub fn base64(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = chunk.iter().enumerate().fold(0u32, |group, (at, &byte)| {
+            group | u32::from(byte) << (16 - 8 * at)
+        });
+        for digit in 0..4 {
+            if digit <= chunk.len() {
+                text.push(DIGITS[(group >> (18 - 6 * digit)) as usize & 63] as char);
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    text
+}
+
 /// `count` paragraphs of filler text.
 pub fn paragraphs(count: usize) -> String {
     (0..count)

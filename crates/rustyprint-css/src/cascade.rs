@@ -65,6 +65,9 @@ pub struct StyleOptions<'a> {
     pub zoom: f32,
     /// An extra author stylesheet applied after the document's own.
     pub stylesheet: Option<&'a str>,
+    /// An extra author stylesheet that is parsed already, applied after `stylesheet`: for
+    /// documents styled one after another with the same one, which parse it once.
+    pub parsed_stylesheet: Option<&'a Stylesheet>,
     /// Loads `<link>` and `@import` stylesheets by URL.
     pub load: &'a dyn Fn(&str) -> Option<String>,
     /// Metrics of an element's first available font, for font-relative units such as `ex`
@@ -79,8 +82,9 @@ pub struct StyleOptions<'a> {
     pub screen: bool,
 }
 
-/// Loads a file's bytes by URL.
-pub type LoadFont<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+/// Loads a file's bytes by URL. Fonts are told apart by where their file is in memory, so
+/// a loader that gives the same bytes for a file every time it is asked makes it one font.
+pub type LoadFont<'a> = &'a dyn Fn(&str) -> Option<Arc<[u8]>>;
 
 /// Computed styles of a document.
 #[derive(Debug, Default)]
@@ -197,6 +201,9 @@ pub fn compute_styles_in(
     collector.add_document(document);
     if let Some(css) = options.stylesheet {
         collector.add(css, Origin::Author, None, "request stylesheet");
+    }
+    if let Some(sheet) = options.parsed_stylesheet {
+        collector.add_parsed(sheet.clone(), Origin::Author, None, "request stylesheet");
     }
     let rules = collector.finish();
     let mut styles = Styles {
@@ -451,7 +458,16 @@ impl<'a> Collector<'a> {
     }
 
     fn add(&mut self, css: &str, origin: Origin, owner: Option<NodeId>, source: &str) {
-        let sheet = Stylesheet::parse(css);
+        self.add_parsed(Stylesheet::parse(css), origin, owner, source);
+    }
+
+    fn add_parsed(
+        &mut self,
+        sheet: Stylesheet,
+        origin: Origin,
+        owner: Option<NodeId>,
+        source: &str,
+    ) {
         self.sheets.push(ParsedSheet {
             sheet,
             origin,
@@ -627,7 +643,7 @@ impl<'a> Collector<'a> {
             let data = self.options.load_font.and_then(|load| load(&rule.src));
             let loaded = data
                 .ok_or_else(|| "it was not found".to_owned())
-                .and_then(|data| ColorProfile::load(&rule.name, data, rule.intent));
+                .and_then(|data| ColorProfile::load(&rule.name, data.to_vec(), rule.intent));
             match loaded {
                 Ok(profile) => color_profiles.push(profile),
                 Err(reason) => flattener.warnings.push(StyleWarning {
@@ -2991,7 +3007,7 @@ fn load_face(
                 });
                 match data.filter(|data| looks_like_font(data)) {
                     Some(data) => {
-                        face.sources.push(FontSource::Data(Arc::from(data)));
+                        face.sources.push(FontSource::Data(data));
                         break;
                     }
                     None => warnings.push(StyleWarning {

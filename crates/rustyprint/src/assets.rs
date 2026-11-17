@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::remote::{self, Remote};
 
@@ -102,6 +103,58 @@ impl<'a> Loader<'a> {
     }
 }
 
+/// The most bytes of font files, with the URLs they came from, that [`FontFiles`] keeps.
+const MAX_FONT_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most URLs [`FontFiles`] keeps.
+const MAX_FONT_FILE_URLS: usize = 256;
+
+/// The font files and color profiles that the documents of a record set load for their
+/// style rules, kept from one document to the next. A URL is loaded once; a file whose
+/// bytes are those of one loaded before, from another URL, is that one. Fonts are told
+/// apart by where their file is in memory, so this is what makes a font of every record
+/// one font of the PDF file.
+///
+/// A file is kept whether a second document uses it or not, up to 64 MB and 256 URLs:
+/// over that the ones used the longest ago go, and a font that is used again after it
+/// went is loaded and embedded again.
+#[derive(Default)]
+pub(crate) struct FontFiles {
+    /// The files, with the one used last at the end.
+    kept: RefCell<Vec<KeptFile>>,
+}
+
+/// A file [`FontFiles`] keeps: the URL it was loaded from, and its bytes.
+type KeptFile = (Box<str>, Arc<[u8]>);
+
+impl FontFiles {
+    /// The file at `url`, which `read` reads if no document has loaded the URL yet.
+    pub fn load(&self, url: &str, read: impl FnOnce() -> Option<Vec<u8>>) -> Option<Arc<[u8]>> {
+        let mut kept = self.kept.borrow_mut();
+        let known = kept.iter().position(|(known, _)| **known == *url);
+        let entry = match known {
+            Some(at) => kept.remove(at),
+            None => {
+                let bytes = read()?;
+                let same = kept.iter().find(|(_, file)| **file == *bytes);
+                let file = same.map_or_else(|| Arc::from(bytes), |(_, file)| file.clone());
+                (Box::from(url), file)
+            }
+        };
+        let file = entry.1.clone();
+        kept.push(entry);
+        let size = |kept: &[KeptFile]| -> usize {
+            kept.iter().map(|(url, file)| url.len() + file.len()).sum()
+        };
+        while kept.len() > 1
+            && (kept.len() > MAX_FONT_FILE_URLS || size(&kept) > MAX_FONT_FILE_BYTES)
+        {
+            kept.remove(0);
+        }
+        Some(file)
+    }
+}
+
 /// The asset path of a relative URL: percent-decoded, without its query, fragment and `.`
 /// segments. A root-relative URL, such as `/assets/app.css` from a web app's view, starts at
 /// the asset root. URLs with a scheme, protocol-relative URLs and paths with `..` have none.
@@ -189,6 +242,50 @@ fn base64(input: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_files_are_read_once_and_shared_by_their_bytes() {
+        let files = FontFiles::default();
+        let reads = std::cell::Cell::new(0);
+        let read = |bytes: &[u8]| {
+            reads.set(reads.get() + 1);
+            Some(bytes.to_vec())
+        };
+        let first = files.load("a.ttf", || read(b"font")).unwrap();
+        let again = files.load("a.ttf", || read(b"font")).unwrap();
+        let other_url = files.load("data:,font", || read(b"font")).unwrap();
+        let other_file = files.load("b.ttf", || read(b"tnof")).unwrap();
+        assert_eq!(reads.get(), 3);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(&first, &other_url));
+        assert!(!Arc::ptr_eq(&first, &other_file));
+        // A file that is not there is asked for again.
+        assert!(files.load("c.ttf", || None).is_none());
+        assert_eq!(&*files.load("c.ttf", || read(b"late")).unwrap(), b"late");
+    }
+
+    #[test]
+    fn font_files_used_the_longest_ago_go_when_there_are_too_many() {
+        let files = FontFiles::default();
+        let load = |number: usize| {
+            let mut read = false;
+            let url = format!("{number}.ttf");
+            files.load(&url, || {
+                read = true;
+                Some(number.to_be_bytes().to_vec())
+            });
+            read
+        };
+        assert!(load(0));
+        assert!(load(1));
+        for number in 2..=MAX_FONT_FILE_URLS {
+            // The first file is used every time, so it is not the one to go.
+            assert!(!load(0));
+            assert!(load(number));
+        }
+        assert!(!load(0));
+        assert!(load(1), "the file used the longest ago was let go of");
+    }
 
     #[test]
     fn relative_paths_are_normalized() {

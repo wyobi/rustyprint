@@ -5,7 +5,9 @@ mod common;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::{image_count, page_count, paragraphs, png};
+use common::{
+    font_count, font_face, font_file, image_count, page_count, paragraphs, png, web_fonts,
+};
 use rustyprint::{Error, Limit, Limits, RecordSet, RenderOptions, Summary, render};
 
 /// The text of each page of a PDF file.
@@ -121,6 +123,72 @@ fn an_image_every_record_has_is_written_once() {
     assert_eq!(page_count(&pdf), 4);
     // The logo once, and each of the four photos.
     assert_eq!(image_count(&pdf), 5);
+}
+
+/// How many times larger a set may be than its content printed whole: a set writes the
+/// resources of every page as an object of their own.
+const MAX_SET_SIZE: f64 = 1.15;
+
+#[test]
+fn the_web_fonts_of_the_stylesheet_are_embedded_once_for_the_set() {
+    let section = |number: usize| {
+        format!(
+            "<section><h1>Record {number}</h1>\
+             <p>Plain text and <b>bold text</b> of record {number}.</p></section>"
+        )
+    };
+    let options = with_stylesheet(&format!(
+        "{} section + section {{ break-before: page }}",
+        web_fonts()
+    ));
+    let whole: String = (0..200).map(section).collect();
+    let whole = render(&whole, &options).unwrap();
+    assert_eq!(whole.warnings, Vec::<String>::new());
+    assert_eq!(page_count(&whole.pdf), 200);
+    // The regular and the bold.
+    assert_eq!(font_count(&whole.pdf), 2);
+
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for number in 0..200 {
+        let added = set.add(&section(number)).unwrap();
+        assert_eq!(added.warnings, Vec::<String>::new());
+    }
+    let (pdf, _) = set.finish().unwrap();
+    assert_eq!(page_count(&pdf), 200);
+    assert_eq!(font_count(&pdf), 2);
+    let ratio = pdf.len() as f64 / whole.pdf.len() as f64;
+    assert!(ratio < MAX_SET_SIZE, "{ratio} times the whole print");
+}
+
+#[test]
+fn a_font_file_is_one_font_of_the_set_wherever_a_record_has_it_from() {
+    let mut options = with_stylesheet(&format!(
+        "{} p {{ font-family: Doc }} @font-face {{ font-family: Asset; font-weight: 700; src: url(bold.ttf) }}",
+        font_face("NotoSansMono-Regular.ttf", 400)
+    ));
+    let bold = font_file("NotoSansMono-Bold.ttf");
+    options.assets.files.insert("bold.ttf".into(), bold);
+    // The same two files again: in a rule of the record, and as a file the record links.
+    let own = format!(
+        "<style>{} {} h1 {{ font: 400 20px Own }} h2 {{ font: 400 16px Asset }}</style>",
+        font_face("NotoSansMono-Regular.ttf", 400).replace("Doc", "Own"),
+        "@font-face { font-family: Own; font-weight: 700; src: url(./bold.ttf?again) }"
+    );
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for number in 0..6 {
+        let style = if number % 2 == 1 { &own } else { "" };
+        let record =
+            format!("{style}<h1>Record <b>{number}</b></h1><h2>In the asset</h2><p>Its text</p>");
+        let added = if number == 4 {
+            set.add_continuing(&record)
+        } else {
+            set.add(&record)
+        };
+        assert_eq!(added.unwrap().warnings, Vec::<String>::new());
+    }
+    let (pdf, _) = set.finish().unwrap();
+    // The regular, the bold, and the bundled font of the headings without the rules.
+    assert_eq!(font_count(&pdf), 3);
 }
 
 #[test]
