@@ -240,6 +240,29 @@ for warning in &output.warnings {
 
 `render` is safe to call from several threads at once. Each render runs on a thread of its own, so deeply nested documents cannot overflow the caller's stack, and a panic inside it comes back as an error.
 
+### Many records as one PDF
+
+`RecordSet` prints many documents one after another as one PDF file, such as a statement per customer, with one of them in memory at a time. Each `add` lays one record out, writes its pages to the writer and lets go of the record.
+
+```rust
+use rustyprint::{RecordSet, RenderOptions};
+
+let file = std::io::BufWriter::new(std::fs::File::create("statements.pdf")?);
+let mut set = RecordSet::open(file, &RenderOptions::default())?;
+for name in ["Ann", "Ben"] {
+    let added = set.add(&format!("<h1>Statement for {name}</h1>"))?;
+    println!("{} pages", added.pages);
+}
+let (_file, summary) = set.finish()?;
+```
+
+- Every record is a document of its own with the options of the set, and starts on a new page. Its first page is a `:first` page.
+- Page numbers run through the set: `counter(page)` carries on from the records before, and so do left and right pages. `counter(pages)` is the number of pages of the record, not of the set.
+- Links reach inside a record only: a link to an element of another record does not resolve.
+- Fonts are embedded once, and an image is written once however many records use it. Decoded images are kept between records only from the second record that uses the same file, up to 64 MB of pixels, so a record's own photo is freed with the record.
+- The limits hold for each record. The whole set has `Limits::max_total_pages` pages at the most, 200,000 by default.
+- A record that fails ends the set: every later call returns an error, and what the writer has is not a whole PDF file.
+
 ## Use it from C
 
 `rustyprint-ffi` is rustyprint as a shared library with a C ABI, for C and any language that can call C; the Ruby gem and the NuGet and npm packages are built on it. Each release has it for every platform as `rustyprint-native-<version>-<target>.tar.gz` (`.zip` for Windows), with the header, or build it with `cargo build --release -p rustyprint-ffi`.

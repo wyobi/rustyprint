@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use rustyprint_css::ComputedValues;
@@ -77,6 +78,16 @@ pub enum ImageData {
 }
 
 impl Image {
+    /// How many bytes the image's pixels take in memory.
+    pub fn bytes(&self) -> usize {
+        match &self.data {
+            ImageData::Jpeg { data, .. } => data.len(),
+            ImageData::Pixels { samples, alpha, .. } => {
+                samples.len() + alpha.as_ref().map_or(0, Vec::len)
+            }
+        }
+    }
+
     /// Decodes a PNG, JPEG, GIF, WebP, BMP or SVG file.
     pub fn decode(bytes: &[u8]) -> Result<Image, String> {
         Self::decode_within(bytes, u64::MAX)
@@ -304,10 +315,129 @@ impl PartialEq for Image {
 /// Fetches the bytes of a file by the URL the document uses, or `None` if it is unavailable.
 pub type LoadFile<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
 
+/// What tells two image files apart without keeping them: their length and two hashes of
+/// their bytes, which start from different states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileKey {
+    length: usize,
+    hashes: [u64; 2],
+}
+
+impl FileKey {
+    fn of(bytes: &[u8]) -> Self {
+        let hash = |seed: u8| {
+            let mut hasher = DefaultHasher::new();
+            seed.hash(&mut hasher);
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+        Self {
+            length: bytes.len(),
+            hashes: [hash(0), hash(1)],
+        }
+    }
+}
+
+/// Decoded images kept from one document to the next, for documents laid out one after
+/// another that share images, such as the logo on every record of a set.
+///
+/// An image is kept once a second document uses the same file, so an image that only one
+/// document has, such as a record's photo, is freed with that document. The images kept
+/// take [`ImageCache::new`]'s number of bytes at the most: over that, the ones used the
+/// longest ago go. Files are told apart by their bytes, not their URLs, so documents with
+/// different `<base>` URLs can share a cache.
+pub struct ImageCache {
+    max_bytes: usize,
+    state: RefCell<Kept>,
+}
+
+#[derive(Default)]
+struct Kept {
+    /// How many documents have started.
+    document: u64,
+    /// The files only one document has used so far, with that document.
+    seen: HashMap<FileKey, u64>,
+    /// The images kept, each with the tick of its last use.
+    images: HashMap<FileKey, (Arc<Image>, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+/// How many files used by one document are remembered, to notice a second use. When
+/// there are more, they are forgotten, and a file is kept from its next second use.
+const MAX_SEEN_FILES: usize = 16_384;
+
+impl ImageCache {
+    /// A cache whose images take `max_bytes` of decoded pixels at the most.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            state: RefCell::new(Kept::default()),
+        }
+    }
+
+    /// Starts the next document: an image is kept when two documents use it.
+    pub fn next_document(&self) {
+        self.state.borrow_mut().document += 1;
+    }
+
+    /// How many bytes of decoded pixels the cache holds.
+    pub fn bytes(&self) -> usize {
+        self.state.borrow().bytes
+    }
+
+    fn get(&self, key: FileKey) -> Option<Arc<Image>> {
+        let mut state = self.state.borrow_mut();
+        state.tick += 1;
+        let tick = state.tick;
+        let (image, used) = state.images.get_mut(&key)?;
+        *used = tick;
+        Some(image.clone())
+    }
+
+    /// Takes note of a file a document decoded, and keeps its image if an earlier
+    /// document used the file too.
+    fn offer(&self, key: FileKey, image: &Arc<Image>) {
+        let mut state = self.state.borrow_mut();
+        let document = state.document;
+        match state.seen.get(&key) {
+            None => {
+                if state.seen.len() >= MAX_SEEN_FILES {
+                    state.seen.clear();
+                }
+                state.seen.insert(key, document);
+                return;
+            }
+            Some(&first) if first == document => return,
+            Some(_) => {}
+        }
+        let size = image.bytes();
+        if size > self.max_bytes {
+            return;
+        }
+        state.seen.remove(&key);
+        while state.bytes + size > self.max_bytes {
+            let oldest = state.images.iter().min_by_key(|(_, (_, used))| *used);
+            let Some((&oldest, _)) = oldest else {
+                break;
+            };
+            if let Some((evicted, _)) = state.images.remove(&oldest) {
+                state.bytes -= evicted.bytes();
+            }
+        }
+        state.tick += 1;
+        let tick = state.tick;
+        state.images.insert(key, (image.clone(), tick));
+        state.bytes += size;
+    }
+}
+
 /// Loads and decodes the images a document refers to, each once.
 pub struct Images<'a> {
     load: LoadFile<'a>,
     cache: RefCell<HashMap<String, Option<Arc<Image>>>>,
+    /// Images decoded for earlier documents.
+    shared: Option<&'a ImageCache>,
     /// Elements painted for `element()`, by ID.
     elements: RefCell<HashMap<String, ElementImage>>,
     /// How many `iframe` documents are being built inside each other.
@@ -330,6 +460,7 @@ impl<'a> Images<'a> {
         Self {
             load,
             cache: RefCell::new(HashMap::new()),
+            shared: None,
             elements: RefCell::new(HashMap::new()),
             frames: Cell::new(0),
             max_pixels: u64::MAX,
@@ -341,6 +472,15 @@ impl<'a> Images<'a> {
     pub fn with_max_pixels(self, max: u64) -> Self {
         Self {
             max_pixels: max,
+            ..self
+        }
+    }
+
+    /// Takes the images that `shared` has kept from earlier documents instead of decoding
+    /// them again, and offers it the ones this document decodes.
+    pub fn with_cache(self, shared: &'a ImageCache) -> Self {
+        Self {
+            shared: Some(shared),
             ..self
         }
     }
@@ -361,13 +501,25 @@ impl<'a> Images<'a> {
                 None
             }
             Some(bytes) if self.too_large(url, &bytes) => None,
-            Some(bytes) => match Image::decode_within(&bytes, self.max_pixels) {
-                Ok(image) => Some(Arc::new(image)),
-                Err(error) => {
-                    self.warn(format!("could not decode image `{url}`: {error}"));
-                    None
+            Some(bytes) => {
+                let key = self.shared.map(|shared| (shared, FileKey::of(&bytes)));
+                match key.and_then(|(shared, key)| shared.get(key)) {
+                    Some(kept) => Some(kept),
+                    None => match Image::decode_within(&bytes, self.max_pixels) {
+                        Ok(image) => {
+                            let image = Arc::new(image);
+                            if let Some((shared, key)) = key {
+                                shared.offer(key, &image);
+                            }
+                            Some(image)
+                        }
+                        Err(error) => {
+                            self.warn(format!("could not decode image `{url}`: {error}"));
+                            None
+                        }
+                    },
                 }
-            },
+            }
         };
         self.cache
             .borrow_mut()
@@ -449,6 +601,81 @@ mod tests {
             .write_to(&mut out, image::ImageFormat::Png)
             .expect("encodes");
         out.into_inner()
+    }
+
+    /// A solid RGB PNG, `width` pixels wide and one high: `3 * width` bytes of pixels.
+    fn strip(width: u32) -> Vec<u8> {
+        png(image::RgbImage::from_pixel(width, 1, image::Rgb([9, 9, 9])).into())
+    }
+
+    /// The images of the next document that shares `cache`, with files by URL.
+    fn document<'a>(
+        cache: &'a ImageCache,
+        load: &'a dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Images<'a> {
+        cache.next_document();
+        Images::new(load).with_cache(cache)
+    }
+
+    #[test]
+    fn a_cache_keeps_an_image_from_the_second_document_that_uses_it() {
+        // Files are told apart by their bytes: the logo has another URL in each document.
+        let load = |url: &str| match url {
+            "logo" | "other/logo" | "third/logo" => Some(strip(4)),
+            "photo1" => Some(strip(5)),
+            "photo2" => Some(strip(6)),
+            _ => None,
+        };
+        let cache = ImageCache::new(1024);
+
+        let first = document(&cache, &load);
+        let logo = Arc::downgrade(&first.get("logo").unwrap());
+        let photo = Arc::downgrade(&first.get("photo1").unwrap());
+        // Twice in one document is not a second document.
+        let again = Arc::downgrade(&first.get("other/logo").unwrap());
+        assert!(!logo.ptr_eq(&again));
+        drop(first);
+        assert_eq!(cache.bytes(), 0);
+        assert!(logo.upgrade().is_none() && photo.upgrade().is_none());
+
+        let second = document(&cache, &load);
+        let logo = second.get("other/logo").unwrap();
+        second.get("photo2").unwrap();
+        drop(second);
+        assert_eq!(cache.bytes(), 12);
+
+        let third = document(&cache, &load);
+        assert!(Arc::ptr_eq(&logo, &third.get("third/logo").unwrap()));
+        assert!(third.warnings().is_empty());
+        assert_eq!(cache.bytes(), 12);
+    }
+
+    #[test]
+    fn a_cache_lets_go_of_the_images_used_the_longest_ago() {
+        let load = |url: &str| Some(strip(url.parse().unwrap()));
+        // Room for the 12 and 15 bytes of two images, or the 30 of one.
+        let cache = ImageCache::new(30);
+        let both = |urls: [&str; 2]| {
+            for _ in 0..2 {
+                let images = document(&cache, &load);
+                for url in urls {
+                    images.get(url).unwrap();
+                }
+            }
+        };
+        both(["4", "5"]);
+        assert_eq!(cache.bytes(), 27);
+        // The image used last stays when a third needs room.
+        let kept = document(&cache, &load).get("5").unwrap();
+        both(["3", "20"]);
+        assert_eq!(cache.bytes(), 24);
+        assert!(Arc::ptr_eq(
+            &kept,
+            &document(&cache, &load).get("5").unwrap()
+        ));
+        // An image larger than the cache is not kept.
+        both(["11", "11"]);
+        assert_eq!(cache.bytes(), 24);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod assets;
 mod json;
 mod options;
 mod remote;
+mod session;
 
 use std::any::Any;
 use std::fmt;
@@ -21,12 +22,13 @@ use std::time::{Duration, Instant};
 use rustyprint_css::StyleOptions;
 use rustyprint_dom::Document;
 use rustyprint_dom::budget::{self, Budget, Exceeded};
-use rustyprint_layout::{Images, PageOptions};
+use rustyprint_layout::{ImageCache, Images, PageOptions};
 
 pub use assets::Assets;
 pub use options::{page_size, parse_length, parse_margin};
 pub use remote::Remote;
 pub use rustyprint_layout::{Sides, Size};
+pub use session::{Added, RecordSet, Summary};
 
 /// Options for a single render.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +96,9 @@ pub struct Limits {
     /// How deeply elements nest in a document: 1 for the root element alone.
     pub max_depth: usize,
     pub max_pages: usize,
+    /// Number of pages of a whole [`RecordSet`], whose records each have `max_pages` at the
+    /// most. A single render does not use it.
+    pub max_total_pages: usize,
     /// Width times height of an image.
     pub max_image_pixels: u64,
     /// How long a render may take; `None` for no deadline.
@@ -107,6 +112,7 @@ impl Default for Limits {
             max_nodes: 500_000,
             max_depth: 512,
             max_pages: 2_000,
+            max_total_pages: 200_000,
             max_image_pixels: 100_000_000,
             timeout: Some(Duration::from_secs(60)),
         }
@@ -121,6 +127,8 @@ pub enum Limit {
     Nodes,
     Depth,
     Pages,
+    /// The pages of a whole [`RecordSet`].
+    TotalPages,
 }
 
 impl fmt::Display for Limit {
@@ -130,6 +138,7 @@ impl fmt::Display for Limit {
             Self::Nodes => "node count",
             Self::Depth => "nesting depth",
             Self::Pages => "page count",
+            Self::TotalPages => "total page count",
         })
     }
 }
@@ -151,7 +160,7 @@ pub struct Output {
     pub warnings: Vec<String>,
 }
 
-/// Errors returned by [`render`].
+/// Errors returned by [`render`] and [`RecordSet`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -163,6 +172,12 @@ pub enum Error {
     /// The render took longer than [`Limits::timeout`].
     #[error("rendering took longer than the deadline")]
     Timeout,
+    /// A [`RecordSet`] that cannot go on, such as one with a record that failed.
+    #[error("record set: {0}")]
+    RecordSet(String),
+    /// The writer of a [`RecordSet`] did not take the PDF.
+    #[error("could not write the PDF: {0}")]
+    Write(String),
     /// A bug in rustyprint, such as a caught panic.
     #[error("internal error: {0}")]
     Internal(String),
@@ -195,7 +210,11 @@ const STACK_SIZE: usize = 256 * 1024 * 1024;
 /// leaves anything behind on the caller's thread. A panic inside it is returned as
 /// [`Error::Internal`].
 pub fn render(html: &str, options: &RenderOptions) -> Result<Output, Error> {
-    within_limits(html, options, || render_on_this_thread(html, options))
+    within_limits(html, options, || {
+        let (laid_out, warnings) = lay_out(html, options)?;
+        let pdf = rustyprint_pdf::write(&laid_out).map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(Output { pdf, warnings })
+    })
 }
 
 /// The width of a document's content in a browser window of the size `window`, in CSS
@@ -226,18 +245,8 @@ fn within_limits<T: Send>(
     work: impl FnOnce() -> Result<T, Error> + Send,
 ) -> Result<T, Error> {
     let limits = &options.limits;
-    if html.len() > limits.max_input_bytes {
-        return Err(Error::LimitExceeded {
-            limit: Limit::InputSize,
-            max: limits.max_input_bytes as u64,
-        });
-    }
-    let budget = Budget {
-        deadline: limits.timeout.and_then(|t| Instant::now().checked_add(t)),
-        max_nodes: limits.max_nodes,
-        max_depth: limits.max_depth,
-        max_pages: limits.max_pages,
-    };
+    check_input_size(html, limits)?;
+    let budget = budget_of(limits);
     let joined = thread::scope(|scope| {
         thread::Builder::new()
             .name("rustyprint".into())
@@ -245,21 +254,69 @@ fn within_limits<T: Send>(
             .spawn_scoped(scope, || budget::run(budget, work))
             .map(|thread| thread.join())
     });
-    let exceeded = |limit, max: usize| Error::LimitExceeded {
-        limit,
-        max: max as u64,
-    };
     match joined {
         Err(error) => Err(Error::Internal(format!(
             "could not start a render thread: {error}"
         ))),
         Ok(Err(panic)) => Err(Error::Internal(panic_message(&*panic))),
-        Ok(Ok(Err(Exceeded::Deadline))) => Err(Error::Timeout),
-        Ok(Ok(Err(Exceeded::Nodes))) => Err(exceeded(Limit::Nodes, limits.max_nodes)),
-        Ok(Ok(Err(Exceeded::Depth))) => Err(exceeded(Limit::Depth, limits.max_depth)),
-        Ok(Ok(Err(Exceeded::Pages))) => Err(exceeded(Limit::Pages, limits.max_pages)),
+        Ok(Ok(Err(exceeded))) => Err(limit_error(exceeded, limits)),
         Ok(Ok(Ok(result))) => result,
     }
+}
+
+/// Fails HTML that is longer than the limit.
+fn check_input_size(html: &str, limits: &Limits) -> Result<(), Error> {
+    if html.len() > limits.max_input_bytes {
+        return Err(exceeded(Limit::InputSize, limits.max_input_bytes));
+    }
+    Ok(())
+}
+
+/// The budget of one document, with its deadline counted from now.
+fn budget_of(limits: &Limits) -> Budget {
+    Budget {
+        deadline: limits.timeout.and_then(|t| Instant::now().checked_add(t)),
+        max_nodes: limits.max_nodes,
+        max_depth: limits.max_depth,
+        max_pages: limits.max_pages,
+    }
+}
+
+fn exceeded(limit: Limit, max: usize) -> Error {
+    Error::LimitExceeded {
+        limit,
+        max: max as u64,
+    }
+}
+
+/// The error of a document that went over its budget.
+fn limit_error(over: Exceeded, limits: &Limits) -> Error {
+    match over {
+        Exceeded::Deadline => Error::Timeout,
+        Exceeded::Nodes => exceeded(Limit::Nodes, limits.max_nodes),
+        Exceeded::Depth => exceeded(Limit::Depth, limits.max_depth),
+        Exceeded::Pages => exceeded(Limit::Pages, limits.max_pages),
+    }
+}
+
+/// Fails a scale outside [`MIN_SCALE`] to [`MAX_SCALE`].
+fn check_scale(options: &RenderOptions) -> Result<(), Error> {
+    let scale = options.scale;
+    if !(MIN_SCALE..=MAX_SCALE).contains(&scale) {
+        return Err(Error::InvalidOptions(format!(
+            "scale: {scale} is not from {MIN_SCALE} to {MAX_SCALE}"
+        )));
+    }
+    Ok(())
+}
+
+/// What a document is laid out after, when it is one record of a [`RecordSet`].
+#[derive(Clone, Copy, Default)]
+struct Preceding<'a> {
+    /// The pages of the records before it.
+    pages: usize,
+    /// The images those records share.
+    images: Option<&'a ImageCache>,
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> String {
@@ -269,17 +326,6 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("unknown cause");
     format!("panicked: {message}")
-}
-
-/// Renders within the budget [`budget::run`] has set for this thread.
-fn render_on_this_thread(html: &str, options: &RenderOptions) -> Result<Output, Error> {
-    #[cfg(feature = "test-support")]
-    if html.contains("<!--rustyprint:panic-->") {
-        panic!("rustyprint:panic comment in the document");
-    }
-    let (laid_out, warnings) = lay_out(html, options)?;
-    let pdf = rustyprint_pdf::write(&laid_out).map_err(|e| Error::Internal(e.to_string()))?;
-    Ok(Output { pdf, warnings })
 }
 
 /// The scroll width of a document laid out for the screen in a window, within the budget
@@ -321,11 +367,25 @@ fn content_width_on_this_thread(html: &str, window: Size, options: &RenderOption
     right.max(window.width)
 }
 
-/// Lays a document out into what its pages paint, with the warnings of doing so.
+/// Lays a document out into what its pages paint, with the warnings of doing so, within
+/// the budget [`budget::run`] has set for this thread.
 fn lay_out(
     html: &str,
     options: &RenderOptions,
 ) -> Result<(rustyprint_layout::display::Document, Vec<String>), Error> {
+    lay_out_after(html, options, &Preceding::default())
+}
+
+/// Lays a document out as [`lay_out`] does, after what `preceding` says comes before it.
+fn lay_out_after(
+    html: &str,
+    options: &RenderOptions,
+    preceding: &Preceding,
+) -> Result<(rustyprint_layout::display::Document, Vec<String>), Error> {
+    #[cfg(feature = "test-support")]
+    if html.contains("<!--rustyprint:panic-->") {
+        panic!("rustyprint:panic comment in the document");
+    }
     let document = Document::parse(html);
     budget::check_document(&document);
     let page = PageOptions {
@@ -344,12 +404,12 @@ fn lay_out(
     let load_font = |url: &str| get(url);
     let load_file = |url: &str| get(url);
     let images = Images::new(&load_file).with_max_pixels(options.limits.max_image_pixels);
+    let images = match preceding.images {
+        Some(shared) => images.with_cache(shared),
+        None => images,
+    };
+    check_scale(options)?;
     let scale = options.scale;
-    if !(MIN_SCALE..=MAX_SCALE).contains(&scale) {
-        return Err(Error::InvalidOptions(format!(
-            "scale: {scale} is not from {MIN_SCALE} to {MAX_SCALE}"
-        )));
-    }
     // A zoom on the root scales every length of the document, so lines and tables reflow
     // to the page area as the document measures it, rather than being scaled as an image.
     let lay_out_at = |zoom: f32| {
@@ -368,7 +428,13 @@ fn lay_out(
             &page,
             &images,
         );
-        let pages = rustyprint_layout::layout_pages(&document, &styles, &page, &images);
+        let pages = rustyprint_layout::layout_pages_after(
+            &document,
+            &styles,
+            &page,
+            &images,
+            preceding.pages,
+        );
         (styles, pages)
     };
     let (mut styles, mut pages) = lay_out_at(scale);

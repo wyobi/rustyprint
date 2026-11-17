@@ -350,6 +350,7 @@ fn lowest(request: &Limits, server: &Limits) -> Limits {
         max_nodes: request.max_nodes.min(server.max_nodes),
         max_depth: request.max_depth.min(server.max_depth),
         max_pages: request.max_pages.min(server.max_pages),
+        max_total_pages: request.max_total_pages.min(server.max_total_pages),
         max_image_pixels: request.max_image_pixels.min(server.max_image_pixels),
         timeout,
     }

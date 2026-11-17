@@ -50,8 +50,16 @@ impl LaidPage {
     }
 }
 
-/// Lays out `root` page by page.
-pub(crate) fn pages(root: &BlockBox, styles: &Styles, defaults: &PageOptions) -> Vec<LaidPage> {
+/// Lays out `root` page by page. `before` is how many pages come before the first: the pages
+/// of the earlier records when the document is one record of a set, which the left and
+/// right pages carry on from. The first page of the document is its `:first` page whatever
+/// comes before it.
+pub(crate) fn pages(
+    root: &BlockBox,
+    styles: &Styles,
+    defaults: &PageOptions,
+    before: usize,
+) -> Vec<LaidPage> {
     // Pages progress in the root's inline direction, or its block flow direction in
     // vertical writing modes: the first page is a right page when they progress left to
     // right (CSS Paged Media 3 § 4.2).
@@ -65,7 +73,7 @@ pub(crate) fn pages(root: &BlockBox, styles: &Styles, defaults: &PageOptions) ->
     } else {
         PageSide::Right
     };
-    let side_of = |index: usize| match (index.is_multiple_of(2), first_side) {
+    let side_of = |index: usize| match ((before + index).is_multiple_of(2), first_side) {
         (true, side) => side,
         (false, PageSide::Right) => PageSide::Left,
         (false, PageSide::Left) => PageSide::Right,

@@ -51,7 +51,7 @@ pub use display::{
 pub use font::{Font, FontError, VerticalMetrics};
 pub use fonts::{FontChoice, font_metrics, select, select_font};
 pub use fragment::{Sides, Turn};
-pub use images::{Image, ImageData, Images};
+pub use images::{Image, ImageCache, ImageData, Images};
 pub use margins::MarginBoxFragment;
 pub use paginate::LaidPage;
 pub use text::{Glyph, shape};
@@ -85,7 +85,7 @@ pub fn layout_tree(
     let built = boxes::build_with_targets(document, styles, images, &boxes::Targets::default())?;
     // Page numbers of link targets come from the paginated layout.
     let root = if built.uses_targets {
-        paginated(document, styles, page, images).0.root
+        paginated(document, styles, page, images, 0).0.root
     } else {
         built.root
     };
@@ -147,6 +147,7 @@ fn paginated(
     styles: &Styles,
     page: &PageOptions,
     images: &Images,
+    before: usize,
 ) -> (boxes::Built, Vec<LaidPage>) {
     let mut targets = boxes::Targets::default();
     let mut pass = 0;
@@ -172,7 +173,7 @@ fn paginated(
                     uses_targets: false,
                 }
             });
-        let pages = paginate::pages(&built.root, styles, page);
+        let pages = paginate::pages(&built.root, styles, page, before);
         if !built.uses_targets || pass == TARGET_PASSES {
             return (built, pages);
         }
@@ -182,7 +183,7 @@ fn paginated(
             pages: pages.len(),
         };
         for (node, target) in &mut found.elements {
-            target.page = first.get(node).copied();
+            target.page = first.get(node).map(|page| before + page);
         }
         if found == targets {
             return (built, pages);
@@ -199,15 +200,36 @@ pub fn layout_pages(
     page: &PageOptions,
     images: &Images,
 ) -> Vec<LaidPage> {
+    layout_pages_after(document, styles, page, images, 0)
+}
+
+/// Lays out a styled document as [`layout_pages`] does, as a document that comes after
+/// `before` pages already laid out, such as one record of a set that is printed as one
+/// file: its page numbers and its left and right pages carry on from them. Its first page
+/// is still a `:first` page, and `counter(pages)` is still the number of its own pages.
+pub fn layout_pages_after(
+    document: &Document,
+    styles: &Styles,
+    page: &PageOptions,
+    images: &Images,
+    before: usize,
+) -> Vec<LaidPage> {
     inline::set_quirks(document.quirks_mode() != rustyprint_dom::QuirksMode::NoQuirks);
-    let (built, mut pages) = paginated(document, styles, page, images);
+    let (built, mut pages) = paginated(document, styles, page, images, before);
     let running = built.running;
     let order = document
         .descendants(document.root())
         .enumerate()
         .map(|(index, node)| (node, index))
         .collect();
-    margins::all(&mut pages, &running, &order, &styles.counter_styles, images);
+    margins::all(
+        &mut pages,
+        &running,
+        &order,
+        &styles.counter_styles,
+        images,
+        before,
+    );
     pages
 }
 

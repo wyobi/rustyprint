@@ -31,6 +31,7 @@ fn default_limits() {
     assert_eq!(limits.max_nodes, 500_000);
     assert_eq!(limits.max_depth, 512);
     assert_eq!(limits.max_pages, 2_000);
+    assert_eq!(limits.max_total_pages, 200_000);
     assert_eq!(limits.max_image_pixels, 100_000_000);
     assert_eq!(limits.timeout, Some(Duration::from_secs(60)));
 }

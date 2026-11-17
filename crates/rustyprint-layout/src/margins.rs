@@ -321,15 +321,20 @@ fn lay_out(block: &BlockBox, rect: Rect) -> BoxFragment {
     fragment
 }
 
-/// Lays out the margin boxes of every page, numbered from one. `running` are the running
-/// elements in document order, and `order` gives each element's position in the document.
+/// Lays out the margin boxes of every page, numbered from one after the `preceding` pages
+/// that come before the first. `running` are the running elements in document order, and `order`
+/// gives each element's position in the document.
 pub(crate) fn all(
     pages: &mut [LaidPage],
     running: &[RunningElement],
     order: &HashMap<NodeId, usize>,
     counter_styles: &CounterStyles,
     images: &Images,
+    preceding: usize,
 ) {
+    // TODO(record-set-total-pages): `counter(pages)` is the page count of this document
+    // alone. In a record set it should be the pages of the whole set, which is only known
+    // when the set is finished; this is the one place that decides the total.
     let total = pages.len();
     let position = |node: Option<NodeId>| node.and_then(|n| order.get(&n).copied());
     // A running element is assigned on the page where the content after it is laid out:
@@ -362,7 +367,14 @@ pub(crate) fn all(
             };
             chosen.map(|r| &r.block)
         };
-        page.margin_boxes = margin_boxes(page, index + 1, total, &find, counter_styles, images);
+        page.margin_boxes = margin_boxes(
+            page,
+            preceding + index + 1,
+            total,
+            &find,
+            counter_styles,
+            images,
+        );
         previous_end = end;
     }
 }
