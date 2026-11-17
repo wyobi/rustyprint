@@ -18,17 +18,14 @@ pub(crate) fn parse(html: &str) -> Document {
         },
         ..Default::default()
     };
-    let sink = Sink(RefCell::new(Document {
-        nodes: vec![Node::new(NodeData::Document)],
-        quirks_mode: QuirksMode::NoQuirks,
-    }));
+    let sink = Sink(RefCell::new(Document::empty(QuirksMode::NoQuirks)));
     parse_document(sink, opts).one(html)
 }
 
 struct Sink(RefCell<Document>);
 
 impl Node {
-    fn new(data: NodeData) -> Self {
+    pub(crate) fn new(data: NodeData) -> Self {
         Self {
             parent: None,
             previous_sibling: None,
@@ -41,7 +38,7 @@ impl Node {
 }
 
 impl Document {
-    fn push(&mut self, data: NodeData) -> NodeId {
+    pub(crate) fn push(&mut self, data: NodeData) -> NodeId {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes"));
         self.nodes.push(Node::new(data));
         id
@@ -51,7 +48,7 @@ impl Document {
         &mut self.nodes[id.index()]
     }
 
-    fn detach(&mut self, id: NodeId) {
+    pub(crate) fn detach(&mut self, id: NodeId) {
         let node = self.node_mut(id);
         let parent = node.parent.take();
         let previous = node.previous_sibling.take();
@@ -74,7 +71,7 @@ impl Document {
         }
     }
 
-    fn append(&mut self, parent: NodeId, child: NodeId) {
+    pub(crate) fn append(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
         let last = self.node(parent).last_child;
         {

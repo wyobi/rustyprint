@@ -6,11 +6,12 @@ use std::thread;
 
 use rustyprint_ffi::{
     RecordSet, RenderResult as RpResult, Request, Status, rp_content_width, rp_record_set_add,
-    rp_record_set_added_pages, rp_record_set_error, rp_record_set_finish, rp_record_set_free,
-    rp_record_set_open, rp_record_set_pages, rp_record_set_records, rp_record_set_take_output,
-    rp_record_set_warnings_json, rp_render, rp_request_add_asset, rp_request_free, rp_request_new,
-    rp_result_content_width, rp_result_error, rp_result_free, rp_result_pdf, rp_result_status,
-    rp_result_warnings_json, rp_version,
+    rp_record_set_add_continuing, rp_record_set_added_pages, rp_record_set_error,
+    rp_record_set_finish, rp_record_set_free, rp_record_set_open, rp_record_set_pages,
+    rp_record_set_records, rp_record_set_take_output, rp_record_set_warnings_json, rp_render,
+    rp_request_add_asset, rp_request_free, rp_request_new, rp_result_content_width,
+    rp_result_error, rp_result_free, rp_result_pdf, rp_result_status, rp_result_warnings_json,
+    rp_version,
 };
 
 /// A request with the given JSON options, or the defaults for `None`.
@@ -500,6 +501,57 @@ fn a_record_set_hands_over_one_pdf_a_record_at_a_time() {
 
     assert_eq!(add_record(set, "<p>Four</p>"), Status::RecordSet);
     assert!(set_error(set).unwrap().contains("finished"));
+    free_set(set);
+}
+
+#[test]
+fn a_record_that_continues_goes_on_the_page_of_the_record_before_it() {
+    let (status, set) = open_set(Some(r#"{"page_size": "A5"}"#));
+    assert_eq!(status, Status::Ok);
+    let row = |n: usize| format!("<tr><td>Row {n}</td></tr>");
+    let pieces = [
+        format!("<table><tbody>{}</tbody></table>", row(1)),
+        format!("<table data-rp-continue><tbody>{}</tbody></table>", row(2)),
+        "<p>After the table</p>".to_owned(),
+    ];
+    let mut pdf = Vec::new();
+    for (index, (piece, pages)) in pieces.iter().zip([1, 0, 0]).enumerate() {
+        let status = if index == 0 {
+            add_record(set, piece)
+        } else {
+            // SAFETY: the set is live and the HTML is a live string.
+            unsafe { rp_record_set_add_continuing(set, piece.as_ptr().cast(), piece.len()) }
+        };
+        assert_eq!(status, Status::Ok, "{:?}", set_error(set));
+        // SAFETY: the set is live.
+        assert_eq!(unsafe { rp_record_set_added_pages(set) }, pages);
+        pdf.extend(take_output(set));
+    }
+    // SAFETY: the set is live.
+    assert_eq!(unsafe { rp_record_set_finish(set) }, Status::Ok);
+    pdf.extend(take_output(set));
+    // SAFETY: the set is live.
+    let summary = unsafe { (rp_record_set_pages(set), rp_record_set_records(set)) };
+    assert_eq!(summary, (1, 3));
+    let document = lopdf::Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.get_pages().len(), 1);
+    let text = document.extract_text(&[1]).unwrap();
+    for shown in ["Row 1", "Row 2", "After the table"] {
+        assert!(text.contains(shown), "{text}");
+    }
+
+    // A null set and HTML that is not there are refused as `rp_record_set_add` refuses them.
+    // SAFETY: a null set is allowed, and so is null HTML with a length.
+    unsafe {
+        assert_eq!(
+            rp_record_set_add_continuing(ptr::null_mut(), c"x".as_ptr(), 1),
+            Status::InvalidArgument
+        );
+        assert_eq!(
+            rp_record_set_add_continuing(set, ptr::null(), 5),
+            Status::InvalidArgument
+        );
+    }
     free_set(set);
 }
 

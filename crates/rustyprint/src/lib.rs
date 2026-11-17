@@ -394,12 +394,42 @@ fn lay_out_after(
     options: &RenderOptions,
     preceding: &Preceding,
 ) -> Result<LaidOut, Error> {
+    let document = parse(html);
+    lay_out_flow(&document, options, preceding, None).map(|flow| flow.laid_out)
+}
+
+/// Parses a document, within the budget [`budget::run`] has set for this thread.
+fn parse(html: &str) -> Document {
     #[cfg(feature = "test-support")]
     if html.contains("<!--rustyprint:panic-->") {
         panic!("rustyprint:panic comment in the document");
     }
     let document = Document::parse(html);
     budget::check_document(&document);
+    document
+}
+
+/// How much smaller than its scale a flow is laid out to fit the page's width, and whether
+/// what is still too wide is cut off: decided when its first piece is laid out.
+type Fit = (f32, bool);
+
+/// A flow laid out up to its open page.
+struct LaidFlow {
+    /// The pages from the open page on.
+    laid_out: LaidOut,
+    /// What the flow keeps for its next piece.
+    open: rustyprint_layout::Open,
+    fit: Fit,
+}
+
+/// Lays out `document`: a whole document, or with `carried` the document of a flow that
+/// carries on from its open page, with what it kept and how it was fitted to the page.
+fn lay_out_flow(
+    document: &Document,
+    options: &RenderOptions,
+    preceding: &Preceding,
+    carried: Option<(&rustyprint_layout::Carried, Fit)>,
+) -> Result<LaidFlow, Error> {
     let page = PageOptions {
         size: options.page_size,
         margin: options.margin,
@@ -426,7 +456,7 @@ fn lay_out_after(
     // to the page area as the document measures it, rather than being scaled as an image.
     let lay_out_at = |zoom: f32| {
         let styles = rustyprint_layout::style(
-            &document,
+            document,
             &StyleOptions {
                 page_size: (area.width, area.height),
                 media_size: (area.width / scale, area.height / scale),
@@ -440,26 +470,29 @@ fn lay_out_after(
             &page,
             &images,
         );
-        let pages = rustyprint_layout::layout_pages_after(
-            &document,
+        let (pages, open) = rustyprint_layout::layout_flow(
+            document,
             &styles,
             &page,
             &images,
             preceding.pages,
             preceding.total,
-        );
-        (styles, pages)
+            carried.map(|(carried, _)| carried),
+        )
+        .map_err(Error::RecordSet)?;
+        Ok::<_, Error>((styles, pages, open))
     };
-    let (mut styles, mut pages) = lay_out_at(scale);
-    let mut clip = false;
-    if options.shrink_to_fit {
+    let (mut shrink, mut clip) = carried.map_or((1.0, false), |(_, fit)| fit);
+    let (mut styles, mut pages, mut open) = lay_out_at(scale / shrink)?;
+    if options.shrink_to_fit && carried.is_none() {
         let overflow = rustyprint_layout::overflow(&pages);
         if (overflow - 1.0) * area.width > SHRINK_TO_FIT_TOLERANCE {
             clip = overflow > MAX_SHRINK_TO_FIT;
-            (styles, pages) = lay_out_at(scale / overflow.min(MAX_SHRINK_TO_FIT));
+            shrink = overflow.min(MAX_SHRINK_TO_FIT);
+            (styles, pages, open) = lay_out_at(scale / shrink)?;
         }
     }
-    let mut laid_out = rustyprint_layout::paint_pages(&document, &styles, &pages, &images, clip);
+    let mut laid_out = rustyprint_layout::paint_pages(document, &styles, &pages, &images, clip);
     let mut warnings: Vec<String> = styles
         .warnings
         .iter()
@@ -475,7 +508,11 @@ fn lay_out_after(
         .enumerate()
         .filter_map(|(index, page)| Some((index, page.deferred.take()?)))
         .collect();
-    Ok((laid_out, warnings, deferred))
+    Ok(LaidFlow {
+        laid_out: (laid_out, warnings, deferred),
+        open,
+        fit: (shrink, clip),
+    })
 }
 
 #[cfg(test)]

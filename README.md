@@ -257,12 +257,32 @@ for name in ["Ann", "Ben"] {
 let (_file, summary) = set.finish()?;
 ```
 
-- Every record is a document of its own with the options of the set, and starts on a new page. Its first page is a `:first` page.
+- Every record is a document of its own with the options of the set, and starts on a new page, unless it is added with `add_continuing`. Its first page is a `:first` page.
 - Page numbers run through the set: `counter(page)` carries on from the records before, and so do left and right pages. `counter(pages)` is the number of pages of the record, not of the set.
 - Links reach inside a record only: a link to an element of another record does not resolve.
 - Fonts are embedded once, and an image is written once however many records use it. Decoded images are kept between records only from the second record that uses the same file, up to 64 MB of pixels, so a record's own photo is freed with the record.
 - The limits hold for each record. The whole set has `Limits::max_total_pages` pages at the most, 200,000 by default.
 - A record that fails ends the set: every later call returns an error, and what the writer has is not a whole PDF file.
+
+#### A long document a piece at a time
+
+`add_continuing` adds a piece of the record before it, instead of a document of its own: its content is laid out as if it were at the end of that record's `<body>`, on the page where that record ended. A long table fed a few hundred rows at a time prints as it does printed whole, with about one piece in memory.
+
+```rust
+let mut set = RecordSet::open(file, &RenderOptions::default())?;
+set.add("<h1>Cover</h1>")?;                                   // a record of its own
+set.add(&format!("{style}<table>{head}<tbody>{rows_1}</tbody></table>"))?;
+set.add_continuing(&format!("{style}<table data-rp-continue>{head}<tbody>{rows_2}</tbody></table>"))?;
+set.add_continuing("<p>Under the table, on its last page.</p>")?;
+set.add("<h1>Appendix</h1>")?;                                // starts a new page
+```
+
+- **The table rule.** A piece that starts with `<table data-rp-continue>` gives the rows of that table's `<tbody>` elements to the last `<tbody>` of the table that the record before it ended with. That table has to be the last thing in the flow so far, and a child of `<body>`. The rows go straight under the rows before them, with no gap and no header in the middle of a page. The `<colgroup>`, `<thead>`, `<tfoot>` and `<caption>` of the piece's table are not used: the table keeps those of its first piece, and its header and footer repeat on every page, as in a table printed whole. A table without the attribute is a table of its own. With the attribute and no table to continue, it is a table of its own as well, and the `add` gives a warning.
+- **Column widths** are those the table had when its first piece was laid out. For `table-layout: fixed`, and for an automatic table whose widths its first rows or its `<col>` elements decide, those are the widths of the table printed whole. Wider content in a later piece wraps in the columns as they are. Rows with more columns than the table started with fail the `add`, before anything of them is written.
+- **What carries on over the pieces:** collapsed borders, `:nth-child()`, `:nth-of-type()`, `:first-child`, sibling combinators, counters that rows add to with `counter-increment`, page numbers, left and right pages, and `counter(pages)` in a page margin, which is the number of pages of the whole set. `:nth-child(… of S)` counts the rows that are already written as matching `S`; `:nth-last-child()` and `:last-child` see the rows there are so far; a `reversed()` counter does not count the rows still to come.
+- **Styles** are those of the record that started: a `<style>` or stylesheet link in the `<head>` of a piece that continues is not used, with a warning unless the first record had the same one.
+- **The open page.** The last page of a record is a page of the file as soon as the record is added, and what it paints is written when the page is full, when a record that does not continue is added, or when the set is finished. Until then the set holds what that page paints and the part of the document that is on it or after it. `Added::pages` of a piece that continues is the pages it started: none when it fits on the open page. A gradient on the open page is written again each time the page is laid out again.
+- **Kept for the whole flow**, rather than let go of when their page is written: elements with `position: fixed` or `position: running()`, `counter-reset` or `counter-set`, `display: list-item`, and `<style>` and `<link>` elements, or elements that have one inside. A `position: fixed` box repeats on the pages laid out with its own piece, not on those of later pieces. Links and `target-counter()` reach only what the flow still holds. A table's `height`, and rows that span into rows of a later piece, are not carried over.
 
 ## Use it from C
 

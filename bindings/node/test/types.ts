@@ -50,10 +50,13 @@ async function main (): Promise<void> {
 
   const set: RecordSet = createRecordSet({ ...options, limits: { maxTotalPages: 1000 }, signal: AbortSignal.timeout(5000) })
   const added: { pdf: Buffer, pages: number, warnings: string[] } = await set.add('<p>x</p>')
+  const continued: { pdf: Buffer, pages: number, warnings: string[] } = await set.add('<p>y</p>', { continue: true })
   const summary: { pdf: Buffer, pages: number, records: number } = await set.finish()
   await set.abort()
   const rows = ['<p>1</p>', '<p>2</p>']
   const stream: NodeJS.ReadableStream = toReadable(renderer.createRecordSet(), async () => rows.shift() ?? null, { highWaterMark: 0 })
+  const slices = [{ html: '<table></table>' }, { html: '<table data-rp-continue></table>', continue: true }]
+  const sliced: NodeJS.ReadableStream = toReadable(createRecordSet(), () => slices.shift() ?? null)
   const recordSetKind: 'record_set' = new RecordSetError('x').kind
 
   const versions: string[] = [VERSION, nativeVersion()]
@@ -71,7 +74,7 @@ async function main (): Promise<void> {
   // @ts-expect-error: a signal stops only renders waiting for a worker, so renderSync takes none.
   renderSync('<p>x</p>', { signal: AbortSignal.abort() })
 
-  void [pdf, warnings, versions, widths, added, summary, stream, recordSetKind]
+  void [pdf, warnings, versions, widths, added, continued, summary, stream, sliced, recordSetKind]
 }
 
 void main

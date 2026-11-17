@@ -588,7 +588,7 @@ fn is_combining(c: char) -> bool {
 
 /// Whether a style makes its element a list item, which has a marker and increments the
 /// `list-item` counter.
-fn is_list_item(style: &ComputedValues) -> bool {
+pub(crate) fn is_list_item(style: &ComputedValues) -> bool {
     matches!(
         style.display,
         Display::Normal {
@@ -863,6 +863,13 @@ impl Builder<'_> {
         self.counters.enter();
         if contained {
             self.counters.contain();
+        }
+        // What the children that a flow has let go of added to counters.
+        if let Some(removed) = self.document.removed_before(node) {
+            for (name, value) in &removed.counters {
+                let counter = self.counters.innermost(&Arc::from(name.as_str()));
+                counter.value = counter.value.saturating_add(*value);
+            }
         }
         let mut outside = None;
         if is_list_item(style)

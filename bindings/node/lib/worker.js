@@ -28,8 +28,8 @@ function endRecordSet () {
 }
 
 // One call of a record set: 'open', 'add', 'finish' or 'abort'.
-function recordSetCall ({ op, options, html }) {
-  if (op === 'add' && recordSet) return addRecord(recordSet, html)
+function recordSetCall ({ op, options, html, continues }) {
+  if (op === 'add' && recordSet) return addRecord(recordSet, html, continues)
   if (op === 'finish' && recordSet) {
     try {
       return finishRecordSet(recordSet)

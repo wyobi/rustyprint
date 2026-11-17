@@ -133,10 +133,12 @@ function takeOutput (set) {
   return length === 0 ? new ArrayBuffer(0) : koffi.view(output, length).slice(0)
 }
 
-// Prints a document as the next record of the set, and gives the bytes of its pages.
-function addRecord (set, html) {
+// Prints a document as the next record of the set, or with `continues` as more of the record
+// before it, and gives the bytes of the pages that are written.
+function addRecord (set, html, continues) {
   const document = bytes(html, 'html')
-  const status = native.rp_record_set_add(set, document, document.byteLength)
+  const add = continues ? native.rp_record_set_add_continuing : native.rp_record_set_add
+  const status = add(set, document, document.byteLength)
   if (status !== 0) throw recordSetError(set, status)
   return {
     pdf: takeOutput(set),

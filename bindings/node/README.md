@@ -78,10 +78,36 @@ const { pdf, pages, records } = await set.finish()   // the last bytes, and the 
 await set.abort()                                    // or give the set up
 ```
 
-- Every record is a document of its own with the set's options and assets, and starts on a new page. Page numbers run through the set, and `counter(pages)` is the number of pages of the whole set, so `"Page " counter(page) " of " counter(pages)` works across records.
+- Every record is a document of its own with the set's options and assets, and starts on a new page, unless it is added with `{ continue: true }`: see below. Page numbers run through the set, and `counter(pages)` is the number of pages of the whole set, so `"Page " counter(page) " of " counter(pages)` works across records.
 - Fonts are embedded once, and an image used by many records is written once.
 - `limits` hold for each record; `limits.maxTotalPages` (200,000 by default) bounds the set.
 - One worker prints the whole set, from its first call until it is finished, aborted or fails, and renders nothing else meanwhile; the renderer's other workers keep rendering. `createRenderer({ concurrency })` has `createRecordSet` too.
+
+### Records that continue: a long table in slices
+
+`set.add(html, { continue: true })` adds a piece of the record before it instead of a document of its own: its content follows on the page where that record ended, as if it were at the end of that record's `<body>`. A document printed a piece at a time comes out as it does printed whole, and rustyprint holds about one piece.
+
+```js
+const set = createRecordSet({ stylesheet: '@page { @bottom-right { content: "Page " counter(page) " of " counter(pages) } }' })
+const header = '<thead><tr><th>Line</th><th>Customer</th><th>Amount</th></tr></thead>'
+let first = true
+const pdf = toReadable(set, async () => {
+  const rows = await cursor.nextRows(250)
+  if (rows.length === 0) return null
+  const table = `<table${first ? '' : ' data-rp-continue'}>${header}<tbody>${rows.map(rowHtml).join('')}</tbody></table>`
+  const record = { html: `<style>${css}</style>${table}`, continue: !first }
+  first = false
+  return record
+})
+```
+
+- **The table rule.** A piece that starts with `<table data-rp-continue>` gives the rows of its `<tbody>` to the table that the record before it ended with, which has to be the last thing in that record and a child of `<body>`. The rows go straight under the rows before them. The table keeps the `<colgroup>`, `<thead>`, `<tfoot>` and column widths of its first piece, and the header and footer repeat on every page, as in a table printed whole; those of a later piece are not used. A table without the attribute is a table of its own. With the attribute and no table to continue, it is a table of its own as well, with a warning. Rows with more columns than the table started with fail the `add`.
+- **Column widths** are those of the first piece. For `table-layout: fixed`, and for an automatic table whose widths its first rows or its `<col>` elements decide, they are the widths of the table printed whole; wider content in a later piece wraps.
+- **What carries on:** collapsed borders, `:nth-child()` and `:nth-of-type()` stripes, `:first-child`, sibling selectors, `counter-increment` counters, page numbers and `counter(pages)`.
+- **Styles** are those of the record that started: a `<style>` in the `<head>` of a piece that continues is not used, with a warning unless it is one the first record had.
+- **The open page.** What the last page of a record paints is written by the next call, or by `finish`, since a piece that continues may add to it: `add` resolves to the bytes written so far, and `pages` of a piece that continues is the pages it started, which is none when it fits on the open page.
+- Records that start a page and records that continue mix in one set: a cover, a table in slices, an appendix.
+- `toReadable` takes `{ html, continue: true }` from `nextHtml` for a record that continues.
 - Calls on a set run one after another: a call made while another runs waits for it.
 - A call that fails ends the set: the bytes so far are not a whole PDF, and later calls reject with a `RecordSetError`. Always `finish` or `abort` a set, so that its worker goes back to the others.
 

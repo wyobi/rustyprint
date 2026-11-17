@@ -53,16 +53,29 @@ impl LaidPage {
     }
 }
 
+/// Where the pages of a flow that is laid out a piece at a time start: on the page that the
+/// piece before left open, which is laid out again with what follows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Start {
+    /// Where the open page continues the root from; `None` on the first page of the flow.
+    pub token: Option<BreakToken>,
+    /// How many pages of the flow come before the open page, so that only the first page
+    /// of the flow is a `:first` page.
+    pub flow_pages: usize,
+}
+
 /// Lays out `root` page by page. `before` is how many pages come before the first: the pages
 /// of the earlier records when the document is one record of a set, which the left and
 /// right pages carry on from. The first page of the document is its `:first` page whatever
-/// comes before it.
+/// comes before it. With a `start` that has a token, the pages are those from that place
+/// on. Returns the pages, and for each where it continues the root from.
 pub(crate) fn pages(
     root: &BlockBox,
     styles: &Styles,
     defaults: &PageOptions,
     before: usize,
-) -> Vec<LaidPage> {
+    start: &Start,
+) -> (Vec<LaidPage>, Vec<Option<BreakToken>>) {
     // Pages progress in the root's inline direction, or its block flow direction in
     // vertical writing modes: the first page is a right page when they progress left to
     // right (CSS Paged Media 3 § 4.2).
@@ -82,7 +95,8 @@ pub(crate) fn pages(
         (false, PageSide::Left) => PageSide::Right,
     };
     let mut pages: Vec<LaidPage> = Vec::new();
-    let mut token: Option<BreakToken> = None;
+    let mut token: Option<BreakToken> = start.token.clone();
+    let mut starts: Vec<Option<BreakToken>> = Vec::new();
     loop {
         let name = flow::resume_page(root, token.as_ref());
         if let Some(side) = token.as_ref().and_then(|t| t.side)
@@ -91,16 +105,17 @@ pub(crate) fn pages(
             // A forced break to a left or right page leaves a blank page in between.
             let key = PageKey {
                 name: name.clone(),
-                first: pages.is_empty(),
+                first: start.flow_pages + pages.len() == 0,
                 side: side_of(pages.len()),
                 blank: true,
             };
             pages.push(setup(styles, defaults, key));
+            starts.push(token.clone());
             budget::check_pages(pages.len());
         }
         let key = PageKey {
             name,
-            first: pages.is_empty(),
+            first: start.flow_pages + pages.len() == 0,
             side: side_of(pages.len()),
             blank: false,
         };
@@ -121,6 +136,7 @@ pub(crate) fn pages(
         );
         page.root = Some(fragment);
         pages.push(page);
+        starts.push(token.clone());
         budget::check_pages(pages.len());
         budget::check_deadline();
         match next {
@@ -143,7 +159,7 @@ pub(crate) fn pages(
         }
     }
     repeat_fixed(&mut pages);
-    pages
+    (pages, starts)
 }
 
 /// Fixed boxes are drawn on every page (CSS 2.1 § 9.6.1). Each is laid out on the page its

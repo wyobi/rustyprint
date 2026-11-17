@@ -385,27 +385,47 @@ impl PseudoClass {
                 NodeData::Text(text) => text.is_empty(),
                 _ => true,
             }),
-            PseudoClass::FirstChild => doc.previous_element_sibling(id).is_none(),
+            PseudoClass::FirstChild => {
+                doc.previous_element_sibling(id).is_none() && doc.removed_siblings(id) == 0
+            }
             PseudoClass::LastChild => doc.next_element_sibling(id).is_none(),
             PseudoClass::OnlyChild => {
-                doc.previous_element_sibling(id).is_none() && doc.next_element_sibling(id).is_none()
+                doc.previous_element_sibling(id).is_none()
+                    && doc.next_element_sibling(id).is_none()
+                    && doc.removed_siblings(id) == 0
             }
-            PseudoClass::FirstOfType => !siblings_before(ctx, id).any(|s| same_type(ctx, s, id)),
+            // The siblings removed from a flow that is printed a piece at a time are taken
+            // to be of the type of those after them, as the rows of a table are.
+            PseudoClass::FirstOfType => {
+                !siblings_before(ctx, id).any(|s| same_type(ctx, s, id))
+                    && doc.removed_siblings(id) == 0
+            }
             PseudoClass::LastOfType => !siblings_after(ctx, id).any(|s| same_type(ctx, s, id)),
             PseudoClass::OnlyOfType => {
                 !siblings_before(ctx, id).any(|s| same_type(ctx, s, id))
                     && !siblings_after(ctx, id).any(|s| same_type(ctx, s, id))
+                    && doc.removed_siblings(id) == 0
             }
             PseudoClass::NthChild(nth, of) => {
-                nth_index(ctx, id, *nth, of.as_ref(), siblings_before(ctx, id))
+                let removed = doc.removed_siblings(id);
+                nth_index(
+                    ctx,
+                    id,
+                    *nth,
+                    of.as_ref(),
+                    siblings_before(ctx, id),
+                    removed,
+                )
             }
             PseudoClass::NthLastChild(nth, of) => {
-                nth_index(ctx, id, *nth, of.as_ref(), siblings_after(ctx, id))
+                nth_index(ctx, id, *nth, of.as_ref(), siblings_after(ctx, id), 0)
             }
             PseudoClass::NthOfType(nth) => {
-                let index = 1 + siblings_before(ctx, id)
-                    .filter(|&s| same_type(ctx, s, id))
-                    .count();
+                let index = 1
+                    + doc.removed_siblings(id)
+                    + siblings_before(ctx, id)
+                        .filter(|&s| same_type(ctx, s, id))
+                        .count();
                 nth.matches(index as i32)
             }
             PseudoClass::NthLastOfType(nth) => {
@@ -523,20 +543,22 @@ fn same_type(ctx: &MatchContext, a: NodeId, b: NodeId) -> bool {
     ctx.element(a).name == ctx.element(b).name
 }
 
-/// Matches `:nth-child()` or `:nth-last-child()`, counting `siblings` (before or after).
+/// Matches `:nth-child()` or `:nth-last-child()`, counting `siblings` (before or after),
+/// and the `removed` siblings that were before them, which are taken to match `of`.
 fn nth_index(
     ctx: &MatchContext,
     id: NodeId,
     nth: Nth,
     of: Option<&SelectorList>,
     siblings: impl Iterator<Item = NodeId>,
+    removed: usize,
 ) -> bool {
+    let index = |counted: usize| nth.matches((1 + removed + counted) as i32);
     match of {
         Some(list) => {
-            list.matches(ctx, id)
-                && nth.matches(1 + siblings.filter(|&s| list.matches(ctx, s)).count() as i32)
+            list.matches(ctx, id) && index(siblings.filter(|&s| list.matches(ctx, s)).count())
         }
-        None => nth.matches(1 + siblings.count() as i32),
+        None => index(siblings.count()),
     }
 }
 

@@ -6,6 +6,7 @@
 mod background;
 mod border_image;
 pub mod boxes;
+mod carry;
 mod color_glyphs;
 pub mod display;
 mod effects;
@@ -44,6 +45,7 @@ use rustyprint_css::page::PageOrientation;
 use rustyprint_css::{ContainerSizes, StyleOptions, Styles, compute_styles_in};
 use rustyprint_dom::{Document, local_name};
 
+pub use carry::{Carried, Open, let_go};
 pub use display::{
     Bookmark, Color, Destination, DisplayItem, FillRule, Link, LinkTarget, Page, Path, PathSegment,
     Point, Rect, Size, TextRun, TextStroke, Upright,
@@ -85,7 +87,10 @@ pub fn layout_tree(
     let built = boxes::build_with_targets(document, styles, images, &boxes::Targets::default())?;
     // Page numbers of link targets come from the paginated layout.
     let root = if built.uses_targets {
-        paginated(document, styles, page, images, 0).0.root
+        match paginated(document, styles, page, images, 0, None) {
+            Ok(paginated) => paginated.built.root,
+            Err(_) => built.root,
+        }
     } else {
         built.root
     };
@@ -140,43 +145,58 @@ pub fn style(
 /// How many times layout runs to let `target-counter()` page numbers settle.
 const TARGET_PASSES: usize = 3;
 
+/// A box tree and its pages, with where each page continues the root from.
+struct Paginated {
+    built: boxes::Built,
+    pages: Vec<LaidPage>,
+    starts: Vec<Option<flow::BreakToken>>,
+}
+
 /// Builds the box tree and paginates it. Content that uses `target-*()` is built again with
-/// the pages its targets landed on, until they stop changing.
+/// the pages its targets landed on, until they stop changing. With `carried`, the pages
+/// are those of a flow from its open page on.
 fn paginated(
     document: &Document,
     styles: &Styles,
     page: &PageOptions,
     images: &Images,
     before: usize,
-) -> (boxes::Built, Vec<LaidPage>) {
+    carried: Option<&Carried>,
+) -> Result<Paginated, String> {
     let mut targets = boxes::Targets::default();
     let mut pass = 0;
     loop {
         pass += 1;
-        let built =
-            boxes::build_with_targets(document, styles, images, &targets).unwrap_or_else(|| {
-                boxes::Built {
-                    root: boxes::BlockBox {
-                        node: None,
-                        style: std::sync::Arc::new(rustyprint_css::ComputedValues::initial()),
-                        contents: boxes::BlockContents::Blocks(Vec::new()),
-                        page: None,
-                        marker: None,
-                        first_line: Vec::new(),
-                        legend: None,
-                        center_contents: false,
-                        shape_image: None,
-                        replaced: None,
-                    },
-                    running: Vec::new(),
-                    targets: Default::default(),
-                    uses_targets: false,
-                    uses_total: false,
-                }
+        let mut built = boxes::build_with_targets(document, styles, images, &targets)
+            .unwrap_or_else(|| boxes::Built {
+                root: boxes::BlockBox {
+                    node: None,
+                    style: std::sync::Arc::new(rustyprint_css::ComputedValues::initial()),
+                    contents: boxes::BlockContents::Blocks(Vec::new()),
+                    page: None,
+                    marker: None,
+                    first_line: Vec::new(),
+                    legend: None,
+                    center_contents: false,
+                    shape_image: None,
+                    replaced: None,
+                },
+                running: Vec::new(),
+                targets: Default::default(),
+                uses_targets: false,
+                uses_total: false,
             });
-        let pages = paginate::pages(&built.root, styles, page, before);
+        let start = match carried {
+            Some(carried) => carried.apply(document, &mut built.root)?,
+            None => paginate::Start::default(),
+        };
+        let (pages, starts) = paginate::pages(&built.root, styles, page, before, &start);
         if !built.uses_targets || pass == TARGET_PASSES {
-            return (built, pages);
+            return Ok(Paginated {
+                built,
+                pages,
+                starts,
+            });
         }
         let first = links::first_pages(&pages);
         let mut found = boxes::Targets {
@@ -187,7 +207,11 @@ fn paginated(
             target.page = first.get(node).map(|page| before + page);
         }
         if found == targets {
-            return (built, pages);
+            return Ok(Paginated {
+                built,
+                pages,
+                starts,
+            });
         }
         targets = found;
     }
@@ -223,29 +247,73 @@ pub fn layout_pages_after(
     before: usize,
     later: Option<&LaterTotal>,
 ) -> Vec<LaidPage> {
+    match layout_flow(document, styles, page, images, before, later, None) {
+        Ok((pages, _)) => pages,
+        // Only a flow that carries on from an open page can fail.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Lays out a styled document as [`layout_pages_after`] does, as a flow that is laid out a
+/// piece at a time. Its last page is open: the next piece may put content on it. So the
+/// caller writes every page but the last, lets go of what those pages have done with
+/// ([`let_go`]), adds the next piece to the document and lays it out again with what it
+/// kept, as `carried`. The pages are then those from the open page on, which is laid out
+/// again with the content that was added, and `before` is how many pages come before that
+/// page. A table that is a child of `<body>` keeps the columns it was first laid out with.
+///
+/// Fails when the document cannot carry on where it was: when rows added to a table have
+/// more columns than the table was laid out with.
+pub fn layout_flow(
+    document: &Document,
+    styles: &Styles,
+    page: &PageOptions,
+    images: &Images,
+    before: usize,
+    later: Option<&LaterTotal>,
+    carried: Option<&Carried>,
+) -> Result<(Vec<LaidPage>, Open), String> {
     inline::set_quirks(document.quirks_mode() != rustyprint_dom::QuirksMode::NoQuirks);
-    let (built, mut pages) = paginated(document, styles, page, images, before);
+    let Paginated {
+        built,
+        mut pages,
+        mut starts,
+    } = paginated(document, styles, page, images, before, carried)?;
+    let flow_pages = carried.map_or(0, Carried::flow_pages) + pages.len().saturating_sub(1);
+    let open = carry::open(
+        document,
+        styles,
+        &built.root,
+        carried,
+        starts.pop().flatten(),
+        flow_pages,
+    );
     if later.is_some() && built.uses_total {
         images.warn(
             "target-counter(…, pages) counts the pages of its own record, not of the set".into(),
         );
     }
     let running = built.running;
-    let order = document
+    let order: std::collections::HashMap<_, _> = document
         .descendants(document.root())
         .enumerate()
         .map(|(index, node)| (node, index))
         .collect();
+    // What comes before the element that an open page starts in is on earlier pages.
+    let earlier = carried
+        .and_then(Carried::starts_in)
+        .and_then(|node| order.get(&node))
+        .map(|position: &usize| position.saturating_sub(1));
     margins::all(
         &mut pages,
         &running,
         &order,
         &styles.counter_styles,
         images,
-        before,
+        (before, earlier),
         later,
     );
-    pages
+    Ok((pages, open))
 }
 
 /// What the margin boxes that waited for the number of pages paint, on their page of a

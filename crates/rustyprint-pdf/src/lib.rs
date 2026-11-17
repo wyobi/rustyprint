@@ -21,7 +21,7 @@ use rustyprint_layout::display::Group;
 use rustyprint_layout::display::LineStyle;
 use rustyprint_layout::display::PrintMarks;
 use rustyprint_layout::display::{
-    ColorProfile, Destination, Document, LinkTarget, Page, Shading, ShadingKind,
+    ColorProfile, Destination, Document, Link, LinkTarget, Shading, ShadingKind,
 };
 use rustyprint_layout::{
     Color, DisplayItem, FillRule, Font, Image, ImageData, Path, PathSegment, Point, TextRun,
@@ -55,6 +55,8 @@ pub enum Error {
     },
     #[error("failed to write the PDF: {0}")]
     Io(#[from] std::io::Error),
+    #[error("a page that was kept open has no place for what is painted on it later")]
+    NothingLater,
 }
 
 /// Writes `document` as a PDF file.
@@ -127,6 +129,42 @@ pub struct Session<W: Write> {
     /// The pages that are painted on again before the file ends, by their place in the
     /// file.
     later: HashMap<usize, LaterPage>,
+    /// The last page of the last batch, when it is kept open.
+    open: Option<OpenPage>,
+}
+
+/// The objects of a page that is kept open, which are written when it is closed: its
+/// content stream, the stream that paints on it later, its resources and its annotations.
+#[derive(Clone, Copy)]
+struct OpenIds {
+    page: Ref,
+    content: Ref,
+    /// The stream that paints on the page later, if the page had something to paint
+    /// later when its page object was written.
+    later: Option<Ref>,
+    resources: Ref,
+    annotations: Ref,
+}
+
+/// A page that is kept open: its page object is written, and what it paints is not, since
+/// the next batch may be that page with more on it.
+struct OpenPage {
+    ids: OpenIds,
+    /// Its place in the file.
+    index: usize,
+    /// Its height in points.
+    height: f32,
+    /// Its content stream, not compressed.
+    content: Vec<u8>,
+    /// What the content stream uses.
+    used: Resources,
+    links: Vec<Link>,
+    /// The pages of its batch, which its links point to.
+    batch: Vec<(Ref, f32)>,
+    /// Whether it is painted on again before the file ends.
+    later: bool,
+    /// The bookmarks to it.
+    bookmarks: Vec<OutlineEntry>,
 }
 
 /// A page that is written and gets more painted on it before the file ends: the content
@@ -279,6 +317,7 @@ impl<W: Write> Session<W> {
             groups: 0,
             palette,
             later: HashMap::new(),
+            open: None,
         })
     }
 
@@ -310,7 +349,83 @@ impl<W: Write> Session<W> {
         document: &Document,
         later: &[usize],
     ) -> Result<(), Error> {
-        let result = self.write_pages(document, later);
+        self.add(document, later, false)
+    }
+
+    /// Writes the pages of `document` as [`Session::add_pages_painted_later`] does, and
+    /// keeps the last of them open: its page object is written, so it is a page of the file
+    /// that links can point to, and what it paints is kept until the page is closed. The
+    /// batch after this one closes it: either as it is, or, with this function again, as
+    /// the first page of that batch, which is then the same page with more on it and is
+    /// painted as that batch has it. [`Session::close_open_page`] closes it as it is.
+    pub fn add_pages_keeping_open(
+        &mut self,
+        document: &Document,
+        later: &[usize],
+    ) -> Result<(), Error> {
+        self.add(document, later, true)
+    }
+
+    /// Writes what the page that was kept open paints, as it is. Does nothing without
+    /// such a page.
+    pub fn close_open_page(&mut self) -> Result<(), Error> {
+        match self.open.take() {
+            Some(open) => self.close(open),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the last page is kept open.
+    pub fn has_open_page(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Writes what a page that was kept open paints, and what it links to.
+    fn close(&mut self, open: OpenPage) -> Result<(), Error> {
+        self.write_streams(vec![(open.ids.content, open.content)], 1)?;
+        let link_ids: Vec<Ref> = open.links.iter().map(|_| self.refs.next()).collect();
+        self.sink.object(|chunk| {
+            chunk
+                .indirect(open.ids.annotations)
+                .array()
+                .items(link_ids.iter().copied());
+        })?;
+        self.write_links(&open.batch, &open.links, open.height, &link_ids)?;
+        match open.ids.later {
+            Some(content_id) => {
+                let later = LaterPage {
+                    content_id,
+                    resources_id: open.ids.resources,
+                    used: open.used,
+                    height: open.height,
+                };
+                if open.later {
+                    self.later.insert(open.index, later);
+                } else {
+                    self.write_later(later, &[])?;
+                }
+            }
+            None if open.later => return Err(Error::NothingLater),
+            None => self.sink.object(|chunk| {
+                let mut resources = chunk
+                    .indirect(open.ids.resources)
+                    .start::<pdf_writer::writers::Resources>();
+                write_resources(
+                    &mut resources,
+                    &open.used,
+                    &self.fonts,
+                    &self.alphas,
+                    &self.images,
+                    &self.palette,
+                );
+            })?,
+        }
+        self.outline.extend(open.bookmarks);
+        Ok(())
+    }
+
+    fn add(&mut self, document: &Document, later: &[usize], keep: bool) -> Result<(), Error> {
+        let result = self.write_pages(document, later, keep);
         // The images of the batch may be gone from memory after it.
         self.batch_images.clear();
         result
@@ -349,14 +464,37 @@ impl<W: Write> Session<W> {
         self.write_images()
     }
 
-    fn write_pages(&mut self, document: &Document, later: &[usize]) -> Result<(), Error> {
+    fn write_pages(
+        &mut self,
+        document: &Document,
+        later: &[usize],
+        keep: bool,
+    ) -> Result<(), Error> {
+        // With `keep`, a page that was kept open is the first page of this batch, with
+        // more on it. Otherwise it is closed as it is.
+        let mut replaced = None;
+        if let Some(open) = self.open.take() {
+            if keep && !document.pages.is_empty() {
+                replaced = Some(open);
+            } else {
+                self.close(open)?;
+            }
+        }
+        let last = document.pages.len().saturating_sub(1);
         // Links can point to a later page of the batch, so its pages take their IDs first.
-        let batch: Vec<Ref> = document.pages.iter().map(|_| self.refs.next()).collect();
+        let pages = document.pages.iter().enumerate();
+        let batch: Vec<(Ref, f32)> = pages
+            .map(|(index, page)| {
+                let kept = replaced.as_ref().filter(|_| index == 0);
+                let id = kept.map(|open| open.ids.page);
+                (id.unwrap_or_else(|| self.refs.next()), page.size.height)
+            })
+            .collect();
         // Content streams are compressed in parallel, a batch of pages at a time, and written
         // after their pages under the IDs taken in page order.
         let threads = compression_threads();
         let mut pending: Vec<(Ref, Vec<u8>)> = Vec::new();
-        for (index, (page, &page_id)) in document.pages.iter().zip(&batch).enumerate() {
+        for (index, (page, &(page_id, _))) in document.pages.iter().zip(&batch).enumerate() {
             rustyprint_dom::budget::check_deadline();
             if pending.len() >= threads * PAGES_PER_THREAD {
                 self.write_streams(std::mem::take(&mut pending), threads)?;
@@ -372,12 +510,79 @@ impl<W: Write> Session<W> {
             }
             let mut used = Resources::default();
             self.render(&mut content, &mut used, &page.items, height)?;
-            let content_id = self.refs.next();
-            pending.push((content_id, content.finish().into_vec()));
 
             // Content is drawn from the trim box's corner; the media box grows around it for
             // the bleed and the marks.
             let extent = bleed + if marked { MARKS_AREA } else { 0.0 };
+
+            // A page that is kept open, and one that was: its page object says where what
+            // it paints will be, which is written when the page is closed.
+            let kept = replaced.take_if(|_| index == 0);
+            let stays = keep && index == last;
+            if kept.is_some() || stays {
+                let (ids, at) = match &kept {
+                    Some(open) => (open.ids, open.index),
+                    None => {
+                        let ids = OpenIds {
+                            page: page_id,
+                            content: self.refs.next(),
+                            later: later.contains(&index).then(|| self.refs.next()),
+                            resources: self.refs.next(),
+                            annotations: self.refs.next(),
+                        };
+                        self.sink.object(|chunk| {
+                            let mut page_writer = chunk.page(page_id);
+                            page_writer
+                                .parent(self.page_tree_id)
+                                .media_box(Rect::new(
+                                    -extent,
+                                    -extent,
+                                    width + extent,
+                                    height + extent,
+                                ))
+                                .contents_array(std::iter::once(ids.content).chain(ids.later));
+                            if extent > 0.0 {
+                                page_writer
+                                    .bleed_box(Rect::new(
+                                        -bleed,
+                                        -bleed,
+                                        width + bleed,
+                                        height + bleed,
+                                    ))
+                                    .trim_box(Rect::new(0.0, 0.0, width, height));
+                            }
+                            if page.rotate != 0 {
+                                page_writer.rotate(page.rotate);
+                            }
+                            page_writer.pair(Name(b"Annots"), ids.annotations);
+                            page_writer.pair(Name(b"Resources"), ids.resources);
+                        })?;
+                        self.page_ids.push(page_id);
+                        (ids, self.page_ids.len() - 1)
+                    }
+                };
+                self.write_images()?;
+                let open = OpenPage {
+                    ids,
+                    index: at,
+                    height,
+                    content: content.finish().into_vec(),
+                    used,
+                    links: page.links.clone(),
+                    batch: batch.clone(),
+                    later: later.contains(&index),
+                    bookmarks: Vec::new(),
+                };
+                if stays {
+                    self.open = Some(open);
+                } else {
+                    self.close(open)?;
+                }
+                continue;
+            }
+
+            let content_id = self.refs.next();
+            pending.push((content_id, content.finish().into_vec()));
             let link_ids: Vec<Ref> = page.links.iter().map(|_| self.refs.next()).collect();
             // A page that is painted on later has a second stream, and its resources are
             // an object of their own, written with that stream.
@@ -416,7 +621,7 @@ impl<W: Write> Session<W> {
                     ),
                 }
             })?;
-            self.write_links(document, &batch, page, &link_ids)?;
+            self.write_links(&batch, &page.links, height, &link_ids)?;
             self.write_images()?;
             if let Some((content_id, resources_id)) = open {
                 let later = LaterPage {
@@ -433,13 +638,19 @@ impl<W: Write> Session<W> {
 
         if !batch.is_empty() {
             for bookmark in &document.bookmarks {
-                let (page, top) = target(document, &batch, &bookmark.target);
-                self.outline.push(OutlineEntry {
+                let (page, top) = target(&batch, &bookmark.target);
+                let entry = OutlineEntry {
                     level: bookmark.level,
                     title: bookmark.title.clone(),
                     page,
                     top,
-                });
+                };
+                // The bookmarks to a page that is kept open are those of the page as it
+                // is closed.
+                match &mut self.open {
+                    Some(open) if open.ids.page == page => open.bookmarks.push(entry),
+                    _ => self.outline.push(entry),
+                }
             }
         }
         Ok(())
@@ -449,6 +660,7 @@ impl<W: Write> Session<W> {
     /// catalog) and the cross-reference table, and returns the writer. A page that was to
     /// be painted on later and was not is closed as it is.
     pub fn finish(mut self) -> Result<W, Error> {
+        self.close_open_page()?;
         // A page that was to be painted on later and was not has nothing more on it.
         let mut open: Vec<usize> = self.later.keys().copied().collect();
         open.sort_unstable();
@@ -495,16 +707,16 @@ impl<W: Write> Session<W> {
         Ok(())
     }
 
-    /// Writes the link annotations of `page`, a page of `document`, whose pages are `batch`.
+    /// Writes the link annotations of a page `height` points high, whose `links` point to
+    /// the pages of `batch`.
     fn write_links(
         &mut self,
-        document: &Document,
-        batch: &[Ref],
-        page: &Page,
+        batch: &[(Ref, f32)],
+        links: &[Link],
+        height: f32,
         ids: &[Ref],
     ) -> Result<(), Error> {
-        let height = page.size.height * PX_TO_PT;
-        for (link, &id) in page.links.iter().zip(ids) {
+        for (link, &id) in links.iter().zip(ids) {
             let rect = link.rect;
             self.sink.object(|chunk| {
                 let mut annotation = chunk.annotation(id);
@@ -525,7 +737,7 @@ impl<W: Write> Session<W> {
                             .uri(Str(uri.as_bytes()));
                     }
                     LinkTarget::Internal(destination) => {
-                        let (page, top) = target(document, batch, destination);
+                        let (page, top) = target(batch, destination);
                         annotation
                             .action()
                             .action_type(ActionType::GoTo)
@@ -1580,13 +1792,9 @@ fn show(content: &mut Content, font: &str, run: &TextRun, page_height: f32, item
 }
 
 /// The page and the top edge in PDF coordinates of a destination.
-fn target(document: &Document, page_ids: &[Ref], destination: &Destination) -> (Ref, f32) {
-    let index = destination.page.min(page_ids.len().saturating_sub(1));
-    let height = document
-        .pages
-        .get(index)
-        .map_or(0.0, |p: &Page| p.size.height);
-    (page_ids[index], (height - destination.y) * PX_TO_PT)
+fn target(pages: &[(Ref, f32)], destination: &Destination) -> (Ref, f32) {
+    let (page, height) = pages[destination.page.min(pages.len().saturating_sub(1))];
+    (page, (height - destination.y) * PX_TO_PT)
 }
 
 fn channel(value: u8) -> f32 {

@@ -510,7 +510,9 @@ fn lay_out(block: &BlockBox, rect: Rect) -> BoxFragment {
 
 /// Lays out the margin boxes of every page, numbered from one after the `preceding` pages
 /// that come before the first. `running` are the running elements in document order, and `order`
-/// gives each element's position in the document.
+/// gives each element's position in the document. With `earlier`, the pages are those of a
+/// flow from a page that is laid out again, and the elements up to that position are on
+/// the pages before it.
 ///
 /// `counter(pages)` is the number of `pages`. With `later`, the pages are part of a set
 /// whose number of pages is not known yet: the boxes that show it are not laid out, and
@@ -521,7 +523,7 @@ pub(crate) fn all(
     order: &HashMap<NodeId, usize>,
     counter_styles: &CounterStyles,
     images: &Images,
-    preceding: usize,
+    (preceding, earlier): (usize, Option<usize>),
     later: Option<&LaterTotal>,
 ) {
     let total = pages.len();
@@ -530,7 +532,7 @@ pub(crate) fn all(
     let mut kept: HashMap<usize, Arc<BlockBox>> = HashMap::new();
     // A running element is assigned on the page where the content after it is laid out:
     // after the last element of the page before, up to the last element of this page.
-    let mut previous_end = None;
+    let mut previous_end = earlier;
     for (index, page) in pages.iter_mut().enumerate() {
         let end = page
             .root

@@ -108,10 +108,31 @@ export interface RecordSetOptions extends RenderOptions {
   signal?: AbortSignal
 }
 
+/** How a record is added to a set. */
+export interface AddOptions {
+  /**
+   * Whether the record is more of the record before it, instead of a document of its own: its
+   * content follows that record's on the same page, as if it were at the end of that record's
+   * `<body>`, so a document printed a piece at a time comes out as it does printed whole. A
+   * piece that starts with `<table data-rp-continue>` adds the rows of that table's `<tbody>` to
+   * the table that the record before ended with, which keeps its column widths, header and
+   * footer; its own `<colgroup>`, `<thead>` and `<tfoot>` are not used. The styles are those of
+   * the record that started. Default: false, so the record starts on a new page.
+   */
+  continue?: boolean
+}
+
 export interface RecordOutput {
-  /** The bytes of the PDF this record added: they follow the bytes of the calls before. */
+  /**
+   * The bytes of the PDF this call wrote: they follow the bytes of the calls before. The last
+   * page of a record is open for a record that continues it: what it paints is written by the
+   * next call.
+   */
   pdf: Buffer
-  /** How many pages the record took. */
+  /**
+   * How many pages the record added to the set: the pages it took, or for a record that
+   * continues, the pages it started, which is none when it fits on the open page.
+   */
   pages: number
   /** Problems found in the record's CSS and assets. */
   warnings: string[]
@@ -136,16 +157,27 @@ export interface RecordSetSummary {
  * set: the bytes so far are not a whole PDF, and later calls reject with a `RecordSetError`.
  */
 export interface RecordSet {
-  /** Prints a document as the next record, on the pages after those printed so far. */
-  add (html: string | Uint8Array | ArrayBuffer): Promise<RecordOutput>
+  /**
+   * Prints a document as the next record, on the pages after those printed so far, or with
+   * `{ continue: true }` as more of the record before it, on that record's last page.
+   */
+  add (html: string | Uint8Array | ArrayBuffer, options?: AddOptions): Promise<RecordOutput>
   /** Ends the PDF. A set without records is a PDF without pages. */
   finish (): Promise<RecordSetSummary>
   /** Gives the set up and frees its worker. Does nothing to a set that has ended; never rejects. */
   abort (): Promise<void>
 }
 
-/** A record's HTML, or null or undefined when there are no more records. */
-export type NextRecord = string | Uint8Array | ArrayBuffer | null | undefined
+/** A record's HTML with how it is added, for a record that continues the one before it. */
+export interface NextRecordOptions extends AddOptions {
+  html: string | Uint8Array | ArrayBuffer
+}
+
+/**
+ * A record's HTML, or its HTML with how it is added, or null or undefined when there are no
+ * more records.
+ */
+export type NextRecord = string | Uint8Array | ArrayBuffer | NextRecordOptions | null | undefined
 
 export interface ToReadableOptions {
   /**
@@ -203,8 +235,9 @@ export function createRecordSet (options?: RecordSetOptions): RecordSet
 /**
  * The PDF of a record set as a Readable that prints only what is read. Each time the consumer
  * wants more, it calls `nextHtml` for the next record, adds it to the set and pushes its
- * bytes; when `nextHtml` gives null, it finishes the set and pushes the last bytes. A consumer
- * that stops reading stops the records. An error, or `destroy()`, aborts the set.
+ * bytes; when `nextHtml` gives null, it finishes the set and pushes the last bytes. A record
+ * given as `{ html, continue: true }` continues the record before it. A consumer that stops
+ * reading stops the records. An error, or `destroy()`, aborts the set.
  */
 export function toReadable (
   set: RecordSet,

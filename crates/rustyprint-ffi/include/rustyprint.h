@@ -230,11 +230,14 @@ rp_status rp_record_set_open(const struct rp_request *request, struct rp_record_
 
 /**
  * Prints `len` bytes of UTF-8 HTML at `html` as the next record of the set, on the pages
- * after those written so far. Returns `RP_STATUS_OK`, with the bytes of the record's pages
- * ready for `rp_record_set_take_output`, its pages for `rp_record_set_added_pages` and its
- * warnings for `rp_record_set_warnings_json`; or why it failed, with a message that
- * `rp_record_set_error` gives. Nothing of the record is kept but those bytes, so a caller
- * that takes them after every record has the library hold one record at a time.
+ * after those of the records so far. Returns `RP_STATUS_OK`, with the bytes of the pages
+ * that are written ready for `rp_record_set_take_output`, the record's pages for
+ * `rp_record_set_added_pages` and its warnings for `rp_record_set_warnings_json`; or why it
+ * failed, with a message that `rp_record_set_error` gives. The last page of the record is
+ * open for a record that continues it (`rp_record_set_add_continuing`): what it paints is
+ * written with the next record or when the set is finished. Besides that page and the
+ * bytes, nothing of the record is kept, so a caller that takes the bytes after every
+ * record has the library hold one record at a time.
  *
  * A record that fails ends the set: what was written is not a whole PDF file, and every
  * later call fails with `RP_STATUS_RECORD_SET`. So does a call on a set that did not open
@@ -247,6 +250,23 @@ rp_status rp_record_set_open(const struct rp_request *request, struct rp_record_
  * is null or points to `len` readable bytes.
  */
 rp_status rp_record_set_add(struct rp_record_set *set, const char *html, size_t len);
+
+/**
+ * Prints `len` bytes of UTF-8 HTML at `html` as more of the record before it: its content
+ * follows that record's on the same page, as if it were at the end of that record's
+ * `<body>`, so a document can be printed a piece at a time and come out as it does printed
+ * whole. A piece that starts with `<table data-rp-continue>` adds the rows of that table to
+ * the table the record before ended with, which keeps its columns, header and footer.
+ * `rp_record_set_added_pages` is then the pages the piece started, which is none when it
+ * fits on the open page. Everything else is as `rp_record_set_add` has it; the first record
+ * of a set can be added either way.
+ *
+ * # Safety
+ *
+ * `set` is null or a live record set no other thread is using. Unless `len` is zero, `html`
+ * is null or points to `len` readable bytes.
+ */
+rp_status rp_record_set_add_continuing(struct rp_record_set *set, const char *html, size_t len);
 
 /**
  * Ends the file: writes what the whole file shares, such as its fonts, its page tree and

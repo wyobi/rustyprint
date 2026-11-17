@@ -8,7 +8,7 @@ const v8 = require('node:v8')
 const vm = require('node:vm')
 const zlib = require('node:zlib')
 const rustyprint = require('..')
-const { pageSizes } = require('./helpers')
+const { pageSizes, pageTexts } = require('./helpers')
 
 const { createRenderer, createRecordSet, toReadable, RecordSetError, LimitExceededError, InvalidOptionsError } = rustyprint
 
@@ -283,6 +283,68 @@ describe('createRecordSet', () => {
     assert.ok(bytes > 180 * 1024 * 1024)
     // With the set's worker, its fonts and a record in flight: far less than the PDF written.
     assert.ok(highest - before < 100 * 1024 * 1024, `RSS grew ${mb(highest - before)} MB over ${records} records`)
+  })
+})
+
+// A table of five columns: its rows from `from` up to `to`, as a table of its own or as more
+// rows of the table before it.
+function tableSlice (from, to, continues) {
+  let rows = ''
+  for (let row = from; row < to; row++) {
+    rows += `<tr><td>${row + 1}</td><td>Customer ${row * 31 % 977}</td><td>Order ${row * 17 % 4999}</td>` +
+      `<td>${row * 7 % 1000}.00</td><td>${'Delivered to the depot. '.repeat(row % 4 + 1)}</td></tr>`
+  }
+  return `<style>
+    table { width: 100%; border-collapse: collapse }
+    td, th { border: 1px solid #888; padding: 2px 6px }
+    tbody tr:nth-child(even) { background: #eef }
+  </style><table${continues ? ' data-rp-continue' : ''}>
+  <thead><tr><th>Line</th><th>Customer</th><th>Order</th><th>Amount</th><th>Delivery</th></tr></thead>
+  <tbody>${rows}</tbody></table>`
+}
+
+describe('a record that continues', () => {
+  it('goes on the page of the record before it', async () => {
+    const set = createRecordSet()
+    const first = await set.add('<p>First</p>')
+    const second = await set.add('<p>Second</p>', { continue: true })
+    const third = await set.add('<p>Third</p>')
+    const end = await set.finish()
+    assert.deepEqual([first.pages, second.pages, third.pages, end.pages, end.records], [1, 0, 1, 2, 3])
+    const pdf = Buffer.concat([first.pdf, second.pdf, third.pdf, end.pdf])
+    assert.deepEqual(pageTexts(pdf), ['FirstSecond', 'Third'])
+  })
+
+  it('refuses options that are not a continue flag', async () => {
+    const set = createRecordSet()
+    assert.throws(() => set.add('<p>x</p>', { continue: 'yes' }), TypeError)
+    assert.throws(() => set.add('<p>x</p>', true), TypeError)
+    await set.abort()
+  })
+
+  it('streams a long table in slices as the PDF of the whole table', async () => {
+    const rows = 1200
+    const size = 150
+    let next = 0
+    const stream = toReadable(createRecordSet(), () => {
+      if (next >= rows) return null
+      const from = next
+      next += size
+      return { html: tableSlice(from, from + size, from > 0), continue: from > 0 }
+    })
+    const chunks = []
+    for await (const chunk of stream) chunks.push(chunk)
+    const sliced = Buffer.concat(chunks)
+    assert.ok(isPdf(sliced))
+    const whole = (await rustyprint.render(tableSlice(0, rows, false))).pdf
+
+    const texts = pageTexts(sliced)
+    assert.ok(texts.length > 20, `the table takes ${texts.length} pages`)
+    assert.equal(pageSizes(sliced).length, pageSizes(whole).length)
+    assert.deepEqual(texts, pageTexts(whole))
+    // Every page has the header once, and the rows run through the slices.
+    for (const text of texts) assert.equal(text.split('LineCustomerOrderAmountDelivery').length, 2)
+    assert.ok(texts.at(-1).includes('1200Customer'))
   })
 })
 

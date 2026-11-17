@@ -122,6 +122,7 @@ static void prints_a_record_set(const char *path) {
     CHECK(fclose(file) == 0);
 
     /* A finished set takes no more records. */
+    CHECK(rp_record_set_add_continuing(set, "<p>x</p>", 8) == RP_STATUS_RECORD_SET);
     CHECK(rp_record_set_add(set, "<p>x</p>", 8) == RP_STATUS_RECORD_SET);
     const char *error = rp_record_set_error(set, &len);
     CHECK(error != NULL && strlen(error) == len && len > 0);

@@ -45,6 +45,35 @@ pub struct Table {
     pub outer: Option<OuterEdges>,
     /// The layout at the last width, which every page of the table shares.
     pub cache: LayoutCache,
+    /// The columns the table keeps whatever its rows are: those it had when the first
+    /// rows of a table that is printed a piece at a time were laid out.
+    pub frozen: Option<Arc<Frozen>>,
+}
+
+/// The columns of a table as they were laid out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frozen {
+    /// The width of each column.
+    pub widths: Vec<f32>,
+    /// The table's border-box width.
+    pub width: f32,
+}
+
+impl Table {
+    /// The columns of the table as it was last laid out.
+    pub(crate) fn laid_columns(&self) -> Option<Frozen> {
+        let cache = self.cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        cache.as_ref().map(|(_, _, prepared)| Frozen {
+            widths: prepared.widths.clone(),
+            width: prepared.width,
+        })
+    }
+
+    /// The rows of the table's body groups, in the order `Resume::Row` counts them.
+    pub(crate) fn body_rows(&self) -> impl Iterator<Item = &Row> {
+        let bodies = self.groups.iter().filter(|g| g.kind == GroupKind::Body);
+        bodies.flat_map(|group| &group.rows)
+    }
 }
 
 /// A column of the grid, with the `table-column` box that made it, if any.
@@ -313,6 +342,7 @@ pub(crate) fn build(
         groups: ordered,
         outer: None,
         cache: LayoutCache::default(),
+        frozen: None,
     };
     place_cells(&mut table, spans);
     if style.border_collapse == BorderCollapse::Collapse {
@@ -1285,6 +1315,10 @@ fn prepare(
     }
     let used: f32 = widths.iter().sum::<f32>() + hs * (n + 1) as f32 + extra;
     width = width.max(used);
+    if let Some(frozen) = table.frozen.as_ref().filter(|f| f.widths.len() == n) {
+        widths.clone_from(&frozen.widths);
+        width = frozen.width;
+    }
 
     if !matches!(kind, BlockKind::Atomic | BlockKind::Item { .. }) {
         let remaining = cb.width - width;

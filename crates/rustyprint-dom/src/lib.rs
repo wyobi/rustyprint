@@ -6,10 +6,13 @@
 pub mod budget;
 pub mod forms;
 mod sink;
+mod splice;
 
+use std::collections::HashMap;
 use std::iter;
 
 pub use html5ever::{LocalName, Namespace, Prefix, QualName, local_name, namespace_url, ns};
+pub use splice::Removed;
 
 /// Index of a node in its [`Document`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -34,6 +37,8 @@ pub enum QuirksMode {
 pub struct Document {
     nodes: Vec<Node>,
     quirks_mode: QuirksMode,
+    /// What was removed from the start of the children of an element, by element.
+    removed: HashMap<NodeId, Removed>,
 }
 
 /// A node and its links to the rest of the tree.
@@ -73,6 +78,15 @@ pub struct Attribute {
 }
 
 impl Document {
+    /// A document without anything in it.
+    fn empty(quirks_mode: QuirksMode) -> Self {
+        Self {
+            nodes: vec![Node::new(NodeData::Document)],
+            quirks_mode,
+            removed: HashMap::new(),
+        }
+    }
+
     /// Parses an HTML document.
     pub fn parse(html: &str) -> Self {
         sink::parse(html)

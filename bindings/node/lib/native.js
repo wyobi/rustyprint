@@ -47,6 +47,8 @@ module.exports = {
   rp_record_set_open: lib.func(
     'int32_t rp_record_set_open(const rp_request *request, _Out_ rp_record_set **out)'),
   rp_record_set_add: lib.func('int32_t rp_record_set_add(rp_record_set *set, const uint8_t *html, size_t len)'),
+  rp_record_set_add_continuing: lib.func(
+    'int32_t rp_record_set_add_continuing(rp_record_set *set, const uint8_t *html, size_t len)'),
   rp_record_set_finish: lib.func('int32_t rp_record_set_finish(rp_record_set *set)'),
   rp_record_set_take_output: lib.func(
     'const uint8_t *rp_record_set_take_output(rp_record_set *set, _Out_ size_t *len)'),

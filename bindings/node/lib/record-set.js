@@ -9,6 +9,23 @@ const { RecordSetError } = require('./errors')
 
 function nothing () {}
 
+// Whether the options of an add say that the record continues the one before it.
+function continuesOf (options) {
+  if (options == null) return false
+  if (typeof options !== 'object') throw new TypeError('the options of add must be an object')
+  const continues = options.continue ?? false
+  if (typeof continues !== 'boolean') throw new TypeError('continue must be a boolean')
+  return continues
+}
+
+// What `nextHtml` gave: a record's HTML, or `{ html, continue }` for one that may continue.
+function recordOf (next) {
+  const whole = typeof next === 'string' || ArrayBuffer.isView(next) || next instanceof ArrayBuffer
+  if (whole) return { html: next, options: undefined }
+  if (typeof next !== 'object') throw new TypeError('nextHtml must give HTML, { html, continue } or null')
+  return { html: next.html, options: { continue: next.continue } }
+}
+
 class RecordSet {
   #pool
   #options
@@ -30,12 +47,14 @@ class RecordSet {
     this.#signal = signal ? AbortSignal.any([signal, this.#waiting.signal]) : this.#waiting.signal
   }
 
-  // Prints a document as the next record, and resolves to the bytes of its pages, the number
-  // of its pages and its warnings.
-  add (html) {
+  // Prints a document as the next record, and resolves to the bytes of the pages that are
+  // written, the number of pages the record added and its warnings. With `continue`, the
+  // document is more of the record before it, and goes on that record's last page.
+  add (html, options) {
+    const continues = continuesOf(options)
     return this.#next(async () => {
       await this.#open()
-      return this.#call({ op: 'add', html })
+      return this.#call({ op: 'add', html, continues })
     })
   }
 
@@ -121,13 +140,14 @@ class RecordSet {
 
 // The PDF of a record set as a Readable that prints only what is read: each time the consumer
 // wants more, it asks `nextHtml` for the next record, adds it and pushes its bytes; when
-// `nextHtml` gives null, it finishes the set and pushes the last bytes. A consumer that stops
-// reading stops the records. An error, or destroy(), aborts the set.
+// `nextHtml` gives null, it finishes the set and pushes the last bytes. `nextHtml` gives a
+// record's HTML, or `{ html, continue: true }` for a record that continues the one before it.
+// A consumer that stops reading stops the records. An error, or destroy(), aborts the set.
 function toReadable (set, nextHtml, { highWaterMark = 0 } = {}) {
   let ended = false
 
   async function more (readable) {
-    // A record always has pages to push; the loop is for a set that would give none.
+    // A record that fills no page writes nothing, so the next one is asked for.
     while (!readable.destroyed) {
       const html = await nextHtml()
       if (readable.destroyed) return
@@ -138,7 +158,8 @@ function toReadable (set, nextHtml, { highWaterMark = 0 } = {}) {
         readable.push(null)
         return
       }
-      const { pdf } = await set.add(html)
+      const next = recordOf(html)
+      const { pdf } = await set.add(next.html, next.options)
       if (pdf.length > 0) {
         readable.push(pdf)
         return
