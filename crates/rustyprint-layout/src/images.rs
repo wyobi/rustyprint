@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rustyprint_css::ComputedValues;
 use rustyprint_css::properties::types::ImageOrientation;
@@ -331,24 +331,45 @@ pub type LoadFile<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
 /// What tells two image files apart without keeping them: their length and two hashes of
 /// their bytes, which start from different states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileKey {
+pub(crate) struct FileKey {
     length: usize,
     hashes: [u64; 2],
 }
 
 impl FileKey {
     fn of(bytes: &[u8]) -> Self {
+        Self::hashed(bytes.len(), |hasher| bytes.hash(hasher))
+    }
+
+    /// The key of what `write` gives a hasher, `length` bytes of it a file's own.
+    pub(crate) fn hashed(length: usize, write: impl Fn(&mut DefaultHasher)) -> Self {
         let hash = |seed: u8| {
             let mut hasher = DefaultHasher::new();
             seed.hash(&mut hasher);
-            bytes.hash(&mut hasher);
+            write(&mut hasher);
             hasher.finish()
         };
         Self {
-            length: bytes.len(),
+            length,
             hashes: [hash(0), hash(1)],
         }
     }
+}
+
+/// What tells the drawings of SVGs in pixels apart: the SVG, with all that it is drawn
+/// from, and the size in pixels it is drawn at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DrawingKey {
+    pub source: FileKey,
+    pub size: (u32, u32),
+}
+
+/// What an image of a cache is the image of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Key {
+    /// A decoded image file. An SVG file drawn whole, at its own size, is one too.
+    File(FileKey),
+    Drawing(DrawingKey),
 }
 
 /// Decoded images kept from one document to the next, for documents laid out one after
@@ -359,19 +380,26 @@ impl FileKey {
 /// take [`ImageCache::new`]'s number of bytes at the most: over that, the ones used the
 /// longest ago go. Files are told apart by their bytes, not their URLs, so documents with
 /// different `<base>` URLs can share a cache.
+///
+/// The drawings of SVGs in pixels are kept here too, within the same number of bytes, and
+/// from the first document on: drawing one again would count its pixels again towards the
+/// limit on them. So an SVG that every document shows at the same size is drawn once and
+/// counted once, and is one image. A drawing that was let go for want of room and is
+/// shown again is drawn again, and its pixels are counted again.
+#[derive(Debug)]
 pub struct ImageCache {
     max_bytes: usize,
-    state: RefCell<Kept>,
+    state: Arc<Mutex<Kept>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Kept {
     /// How many documents have started.
     document: u64,
     /// The files only one document has used so far, with that document.
     seen: HashMap<FileKey, u64>,
     /// The images kept, each with the tick of its last use.
-    images: HashMap<FileKey, (Arc<Image>, u64)>,
+    images: HashMap<Key, (Arc<Image>, u64)>,
     bytes: usize,
     tick: u64,
 }
@@ -385,22 +413,46 @@ impl ImageCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             max_bytes,
-            state: RefCell::new(Kept::default()),
+            state: Arc::default(),
         }
+    }
+
+    /// The same cache, for a picture that draws into it.
+    pub(crate) fn handle(&self) -> Self {
+        Self {
+            max_bytes: self.max_bytes,
+            state: self.state.clone(),
+        }
+    }
+
+    /// What is kept. A thread that failed holding it left it whole: every change is made
+    /// after the last thing that can fail.
+    fn state(&self) -> MutexGuard<'_, Kept> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Starts the next document: an image is kept when two documents use it.
     pub fn next_document(&self) {
-        self.state.borrow_mut().document += 1;
+        self.state().document += 1;
     }
 
     /// How many bytes of decoded pixels the cache holds.
     pub fn bytes(&self) -> usize {
-        self.state.borrow().bytes
+        self.state().bytes
     }
 
-    fn get(&self, key: FileKey) -> Option<Arc<Image>> {
-        let mut state = self.state.borrow_mut();
+    /// The drawing of an SVG in pixels, if it is kept.
+    pub(crate) fn drawing(&self, key: DrawingKey) -> Option<Arc<Image>> {
+        self.get(Key::Drawing(key))
+    }
+
+    /// Keeps the drawing of an SVG in pixels.
+    pub(crate) fn keep_drawing(&self, key: DrawingKey, image: &Arc<Image>) {
+        self.keep(Key::Drawing(key), image);
+    }
+
+    fn get(&self, key: Key) -> Option<Arc<Image>> {
+        let mut state = self.state();
         state.tick += 1;
         let tick = state.tick;
         let (image, used) = state.images.get_mut(&key)?;
@@ -411,25 +463,39 @@ impl ImageCache {
     /// Takes note of a file a document decoded, and keeps its image if an earlier
     /// document used the file too.
     fn offer(&self, key: FileKey, image: &Arc<Image>) {
-        let mut state = self.state.borrow_mut();
-        let document = state.document;
-        match state.seen.get(&key) {
-            None => {
-                if state.seen.len() >= MAX_SEEN_FILES {
-                    state.seen.clear();
+        {
+            let mut state = self.state();
+            let document = state.document;
+            match state.seen.get(&key) {
+                None => {
+                    if state.seen.len() >= MAX_SEEN_FILES {
+                        state.seen.clear();
+                    }
+                    state.seen.insert(key, document);
+                    return;
                 }
-                state.seen.insert(key, document);
-                return;
+                Some(&first) if first == document => return,
+                Some(_) => {}
             }
-            Some(&first) if first == document => return,
-            Some(_) => {}
+            if image.bytes() <= self.max_bytes {
+                state.seen.remove(&key);
+            }
         }
+        self.keep(Key::File(key), image);
+    }
+
+    /// Keeps `image`, unless it is larger than the cache, letting go of the images used
+    /// the longest ago to make room for it.
+    fn keep(&self, key: Key, image: &Arc<Image>) {
         let size = image.bytes();
         if size > self.max_bytes {
             return;
         }
-        state.seen.remove(&key);
-        while state.bytes + size > self.max_bytes {
+        let mut state = self.state();
+        if let Some((replaced, _)) = state.images.remove(&key) {
+            state.bytes -= replaced.bytes();
+        }
+        while state.bytes.saturating_add(size) > self.max_bytes {
             let oldest = state.images.iter().min_by_key(|(_, (_, used))| *used);
             let Some((&oldest, _)) = oldest else {
                 break;
@@ -462,6 +528,8 @@ pub struct Images<'a> {
     svg_file_pictures: RefCell<HashMap<FileKey, Option<Arc<SvgPicture>>>>,
     /// Images decoded for earlier documents.
     shared: Option<&'a ImageCache>,
+    /// The drawings of SVGs in pixels: those of `shared`, or else of this document alone.
+    drawings: ImageCache,
     /// The pictures of `<svg>` elements, by their markup.
     svgs: RefCell<HashMap<String, Option<Arc<SvgPicture>>>>,
     /// The files that images inside `<svg>` elements link to, by URL, each loaded once.
@@ -501,6 +569,7 @@ impl<'a> Images<'a> {
             svg_file_urls: RefCell::new(HashMap::new()),
             svg_file_pictures: RefCell::new(HashMap::new()),
             shared: None,
+            drawings: ImageCache::new(usize::MAX),
             svgs: RefCell::new(HashMap::new()),
             svg_files: RefCell::new(HashMap::new()),
             svg_images: RefCell::new(HashMap::new()),
@@ -547,10 +616,12 @@ impl<'a> Images<'a> {
     }
 
     /// Takes the images that `shared` has kept from earlier documents instead of decoding
-    /// them again, and offers it the ones this document decodes.
+    /// them again, and offers it the ones this document decodes. The SVGs it draws to
+    /// pixels are kept there, and one an earlier document drew is not drawn again.
     pub fn with_cache(self, shared: &'a ImageCache) -> Self {
         Self {
             shared: Some(shared),
+            drawings: shared.handle(),
             ..self
         }
     }
@@ -615,10 +686,10 @@ impl<'a> Images<'a> {
                 }
                 let picture = SvgPicture::new(
                     parsed,
+                    bytes,
                     &ComputedValues::initial(),
                     &|bytes| self.svg_image(bytes),
-                    self.max_pixels,
-                    &self.svg_pixels,
+                    &self.pixels(),
                     &self.svg_shapes,
                     &|warning| self.warn(warning),
                 );
@@ -635,6 +706,15 @@ impl<'a> Images<'a> {
         picture
     }
 
+    /// What limits the drawings of SVGs in pixels, and where they are kept.
+    fn pixels(&self) -> crate::svg::Pixels<'_> {
+        crate::svg::Pixels {
+            max: self.max_pixels,
+            budget: &self.svg_pixels,
+            kept: &self.drawings,
+        }
+    }
+
     /// The image of the file `bytes` loaded from `url`, or of none that could be loaded.
     fn decoded(&self, url: &str, bytes: Option<Vec<u8>>) -> Option<Arc<Image>> {
         let image = match bytes {
@@ -644,16 +724,26 @@ impl<'a> Images<'a> {
             }
             Some(bytes) if self.too_large(url, &bytes) => None,
             Some(bytes) => {
-                let key = self.shared.map(|shared| (shared, FileKey::of(&bytes)));
-                match key.and_then(|(shared, key)| shared.get(key)) {
+                // An SVG file is drawn, which counts towards the limit on such pixels, so
+                // its drawing is kept from the first time on.
+                let svg = crate::svg::is_svg(&bytes);
+                let cache = if svg {
+                    Some(&self.drawings)
+                } else {
+                    self.shared
+                };
+                let key = cache.map(|cache| (cache, FileKey::of(&bytes)));
+                match key.and_then(|(cache, key)| cache.get(Key::File(key))) {
                     Some(kept) => Some(kept),
                     None => match self.decode(&bytes) {
                         // Left blank, which the limit on pixels warns of.
                         Ok(None) => None,
                         Ok(Some(image)) => {
                             let image = Arc::new(image);
-                            if let Some((shared, key)) = key {
-                                shared.offer(key, &image);
+                            match key {
+                                Some((cache, key)) if svg => cache.keep(Key::File(key), &image),
+                                Some((cache, key)) => cache.offer(key, &image),
+                                None => {}
                             }
                             Some(image)
                         }
@@ -717,10 +807,10 @@ impl<'a> Images<'a> {
                 }
                 Some(Arc::new(SvgPicture::new(
                     parsed,
+                    markup.as_bytes(),
                     style,
                     &|bytes| self.svg_image(bytes),
-                    self.max_pixels,
-                    &self.svg_pixels,
+                    &self.pixels(),
                     &self.svg_shapes,
                     &|warning| self.warn(warning),
                 )))
@@ -930,6 +1020,68 @@ mod tests {
         // An image larger than the cache is not kept.
         both(["11", "11"]);
         assert_eq!(cache.bytes(), 24);
+    }
+
+    /// An SVG file `width` CSS pixels wide and one high with a gradient, which is drawn to
+    /// pixels: `16 * width` of them, opaque, so `48 * width` bytes.
+    fn gradient(width: &str) -> Vec<u8> {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='1'>\
+             <linearGradient id='paint'><stop offset='0' stop-color='#ff0000'/>\
+             <stop offset='1' stop-color='#0000ff'/></linearGradient>\
+             <rect width='{width}' height='1' fill='url(#paint)'/></svg>"
+        )
+        .into_bytes()
+    }
+
+    /// The image that the SVG file at `url`, which is its width, is painted as.
+    fn painted(images: &Images, url: &str) -> Option<Arc<Image>> {
+        let Some(FilePicture::Svg(svg)) = images.picture(url) else {
+            panic!("an SVG file");
+        };
+        let mut items = Vec::new();
+        svg.paint(
+            Rect::new(7.0, 9.0, url.parse().unwrap(), 1.0),
+            true,
+            &mut items,
+        );
+        match items.pop() {
+            Some(crate::display::DisplayItem::Image { image, .. }) => Some(image),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_cache_keeps_a_drawing_in_pixels_from_the_first_document_and_counts_it_once() {
+        let load = |url: &str| Some(gradient(url));
+        // Room for the 48 bytes of one drawing or the 96 of the other, and not for both.
+        let cache = ImageCache::new(100);
+        let budget = Arc::new(PixelBudget::new(16 + 32 + 16));
+        let document = || document(&cache, &load).with_svg_budget(&budget);
+
+        let images = document();
+        let first = painted(&images, "1").unwrap();
+        assert!(Arc::ptr_eq(&first, &painted(&images, "1").unwrap()));
+        assert_eq!((cache.bytes(), budget.used()), (48, 16));
+        // The next document has the same image, and takes no pixels for it.
+        let images = document();
+        assert!(Arc::ptr_eq(&first, &painted(&images, "1").unwrap()));
+        assert_eq!((cache.bytes(), budget.used()), (48, 16));
+
+        // Another drawing needs the room, so the first is let go, and is drawn again
+        // and counted again when a document shows it again.
+        painted(&document(), "2").unwrap();
+        assert_eq!((cache.bytes(), budget.used()), (96, 48));
+        let images = document();
+        let again = painted(&images, "1").unwrap();
+        assert!(!Arc::ptr_eq(&first, &again));
+        assert_eq!((cache.bytes(), budget.used()), (48, 64));
+        assert!(images.warnings().is_empty());
+        // With no pixels left, one that has to be drawn again is left blank.
+        let images = document();
+        assert!(painted(&images, "2").is_none());
+        assert!(Arc::ptr_eq(&again, &painted(&images, "1").unwrap()));
+        assert_eq!(images.warnings().len(), 1);
     }
 
     #[test]

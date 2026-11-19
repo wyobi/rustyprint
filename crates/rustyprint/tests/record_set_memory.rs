@@ -92,3 +92,39 @@ fn a_set_holds_no_pixels_of_the_records_it_printed() {
     assert_eq!(summary.records, RECORDS + 1);
     assert!(summary.pages > RECORDS);
 }
+
+/// A logo with a gradient, which is drawn to pixels: 800 × 240 of them.
+const LOGO: &str = "<svg width='200' height='60'>\
+    <linearGradient id='paint'><stop offset='0' stop-color='#ff8800'/>\
+    <stop offset='1' stop-color='#0044ff'/></linearGradient>\
+    <rect width='200' height='60' rx='8' fill='url(#paint)'/></svg>";
+
+/// Prints what a set of 500 records with the same gradient logo takes. Run it alone:
+/// `cargo test --release -p rustyprint --test record_set_memory -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, which checks nothing"]
+fn measure_a_set_with_the_same_gradient_logo_on_every_record() {
+    let started = std::time::Instant::now();
+    let mut set = RecordSet::open(Vec::new(), &RenderOptions::default()).unwrap();
+    let (mut peak, mut warned) = (resident_kb(), 0);
+    for number in 0..500 {
+        let added = set
+            .add(&format!("{LOGO}<p>Certificate {number}</p>"))
+            .unwrap();
+        warned += usize::from(!added.warnings.is_empty());
+        if number % SAMPLE_EVERY == 0 {
+            peak = peak.max(resident_kb());
+        }
+    }
+    let (pdf, summary) = set.finish().unwrap();
+    println!(
+        "records={} pages={} pdf_bytes={} images={} records_with_warnings={warned} \
+         peak_rss_kb={} seconds={:.2}",
+        summary.records,
+        summary.pages,
+        pdf.len(),
+        common::image_count(&pdf),
+        peak.max(resident_kb()),
+        started.elapsed().as_secs_f64()
+    );
+}

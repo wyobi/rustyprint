@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,7 @@ use usvg::fontdb;
 
 use crate::Font;
 use crate::display::{DisplayItem, Rect};
-use crate::images::{Fit, Image};
+use crate::images::{DrawingKey, FileKey, Fit, Image, ImageCache};
 use crate::raster::Raster;
 
 /// The image pixels drawn for each CSS pixel of the SVG's size: 384 per inch.
@@ -73,6 +74,10 @@ pub(crate) struct Parsed {
     pub fit: Option<Fit>,
     /// What was left out of it, such as an image over the limit.
     pub warnings: Vec<String>,
+    /// The files its `<image>` elements could link to, by the URL as written.
+    files: Arc<HashMap<String, Arc<Vec<u8>>>>,
+    /// The fonts its text is drawn in.
+    fonts: Vec<Font>,
 }
 
 /// Reads an SVG file, whose images may have at most `max_pixels` pixels each.
@@ -88,6 +93,9 @@ pub(crate) fn parse(bytes: &[u8], max_pixels: u64, resources: Resources) -> Resu
     } = resources;
     let warnings: Arc<Mutex<Vec<String>>> = Arc::default();
     let refused = warnings.clone();
+    let files = Arc::new(files);
+    let linked = files.clone();
+    let used = UsedFonts::default();
     let data = usvg::ImageHrefResolver::default_data_resolver();
     let file = usvg::ImageHrefResolver::default_data_resolver();
     let options = usvg::Options {
@@ -107,13 +115,14 @@ pub(crate) fn parse(bytes: &[u8], max_pixels: u64, resources: Resources) -> Resu
             }),
             // The kind of file is read from its bytes.
             resolve_string: Box::new(move |href, options| {
-                file("text/plain", files.get(href)?.clone(), options)
+                file("text/plain", linked.get(href)?.clone(), options)
             }),
         },
         fontdb: fonts.database(),
         font_resolver: font_resolver(
             style.unwrap_or_else(|| Arc::new(ComputedValues::initial())),
             fonts,
+            used.clone(),
         ),
         // The font of text that names none, as for page text.
         font_family: "serif".into(),
@@ -153,6 +162,8 @@ pub(crate) fn parse(bytes: &[u8], max_pixels: u64, resources: Resources) -> Resu
         shape_only: shape_only(xml.root_element()),
         fit: fit(xml.root_element()),
         warnings,
+        files,
+        fonts: used.taken(),
     })
 }
 
@@ -370,6 +381,12 @@ enum Content {
         /// The most pixels of one drawing.
         max_pixels: u64,
         budget: Arc<PixelBudget>,
+        /// The drawings kept for every picture of the same SVG, in this document and in
+        /// the ones laid out with it, so that each is drawn and counted once.
+        kept: ImageCache,
+        /// What tells the SVG apart from any other.
+        source: FileKey,
+        /// What the picture was given for each size: the document gets the same again.
         drawn: Mutex<Vec<Drawn>>,
     },
 }
@@ -377,17 +394,49 @@ enum Content {
 /// A drawing in pixels, or none if there were too few left, by its size in pixels.
 type Drawn = ((u32, u32), Option<Arc<Image>>);
 
+/// What limits the drawings of a document's SVGs in pixels, and where they are kept.
+pub(crate) struct Pixels<'a> {
+    /// The most pixels of one drawing.
+    pub max: u64,
+    pub budget: &'a Arc<PixelBudget>,
+    pub kept: &'a ImageCache,
+}
+
+/// What tells the drawings in pixels of the SVG file `bytes` apart from those of any
+/// other: its markup, the files it links to, the fonts of its text and the most pixels an
+/// image in it may have.
+fn source_key(bytes: &[u8], parsed: &Parsed, max_pixels: u64) -> FileKey {
+    let mut files: Vec<_> = parsed.files.iter().collect();
+    files.sort_by_key(|(url, _)| url.as_str());
+    // A font file is read once for the two hashes of the key.
+    let fonts: Vec<(usize, u64, u32)> = parsed
+        .fonts
+        .iter()
+        .map(|font| {
+            let mut hasher = DefaultHasher::new();
+            font.data().hash(&mut hasher);
+            (font.data().len(), hasher.finish(), font.index())
+        })
+        .collect();
+    FileKey::hashed(bytes.len(), |hasher| {
+        bytes.hash(hasher);
+        max_pixels.hash(hasher);
+        files.hash(hasher);
+        fonts.hash(hasher);
+    })
+}
+
 impl SvgPicture {
-    /// The picture of a parsed `<svg>` element whose style is `style`. Images it holds are
-    /// decoded by `decode`; `max_pixels` and `budget` limit what is drawn to pixels,
-    /// `shapes` is how many more path segments and glyphs the document may draw, and
-    /// `warn` is told what was left out.
+    /// The picture of an `<svg>` element whose style is `style`, parsed from the SVG file
+    /// `bytes`. Images it holds are decoded by `decode`; `pixels` limits what is drawn to
+    /// pixels, `shapes` is how many more path segments and glyphs the document may draw,
+    /// and `warn` is told what was left out.
     pub(crate) fn new(
         parsed: Parsed,
+        bytes: &[u8],
         style: &ComputedValues,
         decode: &dyn Fn(&[u8]) -> Option<Arc<Image>>,
-        max_pixels: u64,
-        budget: &Arc<PixelBudget>,
+        pixels: &Pixels,
         shapes: &Cell<u64>,
         warn: &dyn Fn(String),
     ) -> Self {
@@ -413,9 +462,11 @@ impl SvgPicture {
                 Content::Items(Arc::from([]))
             }
             Err(Refused::Unsupported) => Content::Pixels {
+                source: source_key(bytes, &parsed, pixels.max),
                 tree: Box::new(parsed.tree),
-                max_pixels,
-                budget: budget.clone(),
+                max_pixels: pixels.max,
+                budget: pixels.budget.clone(),
+                kept: pixels.kept.handle(),
                 drawn: Mutex::new(Vec::new()),
             },
         };
@@ -494,12 +545,16 @@ impl SvgPicture {
 
     /// The drawing in pixels for the box `rect`, with the drawing itself at `placed`: four
     /// pixels for each CSS pixel of the box, or fewer within the limit on an image. `None`
-    /// with a warning if the document has too few pixels left for it.
+    /// with a warning if the document has too few pixels left for it. A drawing of the
+    /// same SVG at the same size that is still kept, from this document or one laid out
+    /// before it, is the same image and takes no more pixels.
     fn pixels(&self, rect: Rect, placed: Rect) -> Option<Arc<Image>> {
         let Content::Pixels {
             tree,
             max_pixels,
             budget,
+            kept,
+            source,
             drawn,
         } = &self.content
         else {
@@ -511,22 +566,28 @@ impl SvgPicture {
         if let Some((_, image)) = drawn.iter().find(|(known, _)| *known == size) {
             return image.clone();
         }
-        let image = budget
-            .take(u64::from(size.0) * u64::from(size.1))
-            .then(|| {
-                rustyprint_dom::budget::check_deadline();
-                let (sx, sy) = (size.0 as f32 / rect.width, size.1 as f32 / rect.height);
-                let transform = tiny_skia::Transform::from_row(
-                    sx * placed.width / self.size.0,
-                    0.0,
-                    0.0,
-                    sy * placed.height / self.size.1,
-                    sx * (placed.x - rect.x),
-                    sy * (placed.y - rect.y),
-                );
-                draw(tree, size.0, size.1, transform).map(Arc::new)
-            })
-            .flatten();
+        let key = DrawingKey {
+            source: *source,
+            size,
+        };
+        let image = kept.drawing(key).or_else(|| {
+            if !budget.take(u64::from(size.0) * u64::from(size.1)) {
+                return None;
+            }
+            rustyprint_dom::budget::check_deadline();
+            let (sx, sy) = (size.0 as f32 / rect.width, size.1 as f32 / rect.height);
+            let transform = tiny_skia::Transform::from_row(
+                sx * placed.width / self.size.0,
+                0.0,
+                0.0,
+                sy * placed.height / self.size.1,
+                sx * (placed.x - rect.x),
+                sy * (placed.y - rect.y),
+            );
+            let image = Arc::new(draw(tree, size.0, size.1, transform)?);
+            kept.keep_drawing(key, &image);
+            Some(image)
+        });
         drawn.push((size, image.clone()));
         image
     }
@@ -657,24 +718,58 @@ pub(crate) fn font_style(style: &ComputedValues, font: &usvg::Font) -> ComputedV
     wanted
 }
 
+/// The fonts the text of one SVG is drawn in.
+#[derive(Clone, Default)]
+struct UsedFonts(Arc<Mutex<Vec<Font>>>);
+
+impl UsedFonts {
+    fn note(&self, font: &Font) {
+        if let Ok(mut used) = self.0.lock()
+            && !used
+                .iter()
+                .any(|known| known.same_file(font) && known.index() == font.index())
+        {
+            used.push(font.clone());
+        }
+    }
+
+    fn taken(&self) -> Vec<Font> {
+        self.0
+            .lock()
+            .map(|mut used| std::mem::take(&mut *used))
+            .unwrap_or_default()
+    }
+}
+
 /// Chooses the fonts of SVG text as the engine chooses them for page text with `style`:
-/// from its `@font-face` rules and the bundled families, with the same fallbacks.
-fn font_resolver(style: Arc<ComputedValues>, fonts: Fonts) -> usvg::FontResolver<'static> {
-    let (select_style, select_fonts) = (style.clone(), fonts.clone());
+/// from its `@font-face` rules and the bundled families, with the same fallbacks. `used`
+/// is told each font chosen.
+fn font_resolver(
+    style: Arc<ComputedValues>,
+    fonts: Fonts,
+    used: UsedFonts,
+) -> usvg::FontResolver<'static> {
+    let (select_style, select_fonts, select_used) = (style.clone(), fonts.clone(), used.clone());
     usvg::FontResolver {
         select_font: Box::new(move |font, database| {
             let wanted = font_style(&select_style, font);
-            select_fonts.load(&crate::fonts::select(&wanted).font, database)
+            let font = crate::fonts::select(&wanted).font;
+            select_used.note(&font);
+            select_fonts.load(&font, database)
         }),
-        select_fallback: Box::new(move |c, used, database| {
+        select_fallback: Box::new(move |c, tried, database| {
             let choice = crate::fonts::select(&style);
             choice
                 .fallbacks
                 .into_iter()
                 .chain(crate::fonts::script_fallback(&style, c))
                 .filter(|font| font.covers(c))
-                .filter_map(|font| fonts.load(&font, database))
-                .find(|id| !used.contains(id))
+                .filter_map(|font| Some((fonts.load(&font, database)?, font)))
+                .find(|(id, _)| !tried.contains(id))
+                .map(|(id, font)| {
+                    used.note(&font);
+                    id
+                })
         }),
     }
 }

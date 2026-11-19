@@ -159,6 +159,90 @@ fn the_records_of_a_set_draw_their_pictures_within_one_limit() {
     assert_eq!(image_count(&pdf), 3);
 }
 
+/// The image objects that each page of the PDF shows.
+fn page_images(pdf: &[u8]) -> Vec<Vec<lopdf::ObjectId>> {
+    let doc = lopdf::Document::load_mem(pdf).expect("valid PDF");
+    doc.get_pages()
+        .into_values()
+        .map(|page| {
+            let images = doc.get_page_images(page).expect("page images");
+            images.into_iter().map(|image| image.id).collect()
+        })
+        .collect()
+}
+
+/// A logo with a gradient, which is drawn to pixels: 800 × 240 of them.
+const GRADIENT_LOGO: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='60'>\
+    <linearGradient id='paint'><stop offset='0' stop-color='#ff8800'/>\
+    <stop offset='1' stop-color='#0044ff'/></linearGradient>\
+    <rect width='200' height='60' fill='url(#paint)'/></svg>";
+
+/// Prints 500 records that each show the logo as `shown`, with pixels for one drawing of
+/// it: every page shows the one image of the file.
+fn the_logo_is_drawn_once_for_500_records(shown: &str) {
+    let mut options = RenderOptions::default();
+    options
+        .assets
+        .files
+        .insert("logo.svg".into(), GRADIENT_LOGO.as_bytes().to_vec());
+    options.limits.max_svg_pixels = 800 * 240;
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for number in 0..500 {
+        let added = set.add(&format!("{shown}<p>Record {number}</p>")).unwrap();
+        assert_eq!(added.warnings, Vec::<String>::new(), "record {number}");
+    }
+    let (pdf, _) = set.finish().unwrap();
+    assert_eq!(image_count(&pdf), 1);
+    let shown = page_images(&pdf);
+    assert_eq!(shown.len(), 500);
+    assert_eq!(shown[0].len(), 1);
+    assert!(shown.iter().all(|images| *images == shown[0]));
+}
+
+#[test]
+fn a_drawing_in_pixels_that_every_record_has_is_drawn_and_written_once() {
+    the_logo_is_drawn_once_for_500_records(GRADIENT_LOGO);
+}
+
+#[test]
+fn an_svg_file_drawn_to_pixels_that_every_record_has_is_drawn_and_written_once() {
+    the_logo_is_drawn_once_for_500_records("<img src='logo.svg'>");
+}
+
+#[test]
+fn drawings_in_pixels_that_the_set_let_go_of_are_drawn_again_within_the_limit() {
+    // Each drawing is 4000 × 3040 opaque pixels, 36 MB of them: the set keeps one of the
+    // two at a time, so each record draws its own again.
+    let record = |number: usize| {
+        format!(
+            "<svg width='1000' height='760'>\
+             <linearGradient id='paint'><stop offset='0' stop-color='#ff00{:02x}'/>\
+             <stop offset='1' stop-color='#0000ff'/></linearGradient>\
+             <rect width='1000' height='760' fill='url(#paint)'/></svg>",
+            200 * (number % 2)
+        )
+    };
+    let mut options = RenderOptions {
+        stylesheet: Some("@page { size: 1100px 900px; margin: 20px }".to_owned()),
+        ..RenderOptions::default()
+    };
+    options.limits.max_svg_pixels = 3 * 4000 * 3040;
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for number in 0..4 {
+        let added = set.add(&record(number)).unwrap();
+        // The pixels are counted each time a drawing is made, so the fourth is left blank.
+        assert_eq!(added.warnings.len(), usize::from(number == 3), "{number}");
+    }
+    let (pdf, _) = set.finish().unwrap();
+    assert_eq!(image_count(&pdf), 2);
+    let shown = page_images(&pdf);
+    assert_eq!(shown.len(), 4);
+    assert_eq!(shown[0].len(), 1);
+    assert_eq!(shown[2], shown[0]);
+    assert_ne!(shown[1], shown[0]);
+    assert_eq!(shown[3], Vec::new());
+}
+
 /// How many times larger a set may be than its content printed whole: a set writes the
 /// resources of every page as an object of their own.
 const MAX_SET_SIZE: f64 = 1.15;

@@ -22,7 +22,8 @@ use crate::{
 /// more rows of the table that the piece before ended with.
 const CONTINUES_TABLE: &str = "data-rp-continue";
 
-/// The decoded pixels a set keeps, at the most, of the images that its records share.
+/// The decoded pixels a set keeps, at the most, of the images that its records share and
+/// of the SVGs it drew to pixels.
 const SHARED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A record added to a [`RecordSet`].
@@ -89,6 +90,11 @@ pub struct Summary {
 ///   second record uses the same file, up to 64 MB of pixels with the ones used the
 ///   longest ago let go first, so a logo is decoded twice and a record's own photo is
 ///   freed with the record.
+/// - An SVG that has to be drawn to pixels, as one with a gradient or a filter does, is
+///   drawn once for all the records that show it at the same size, and its pixels count
+///   once towards [`Limits::max_svg_pixels`], which is for the whole set. The drawings
+///   are kept within the same 64 MB as the images; one that was let go to make room and
+///   is shown again is drawn again, and counts again.
 ///
 /// # Records that continue
 ///
