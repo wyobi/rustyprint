@@ -541,6 +541,7 @@ impl Printer {
         let load_file = |url: &str| loader.get(url);
         let images = Images::new(&load_file)
             .with_max_pixels(self.options.limits.max_image_pixels)
+            .with_max_svg_pixels(self.options.limits.max_svg_pixels)
             .with_cache(&self.images);
         for (page, margins) in std::mem::take(&mut self.deferred) {
             budget::check_deadline();

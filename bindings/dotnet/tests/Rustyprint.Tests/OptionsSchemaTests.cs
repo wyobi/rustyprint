@@ -78,6 +78,7 @@ public class OptionsSchemaTests
                 MaxPages = 10,
                 MaxTotalPages = 40,
                 MaxImagePixels = 1_000_000,
+                MaxSvgPixels = 1_000_000,
                 Timeout = TimeSpan.FromSeconds(30),
             },
         };

@@ -51,6 +51,7 @@ struct LimitOptions {
     max_pages: Option<usize>,
     max_total_pages: Option<usize>,
     max_image_pixels: Option<u64>,
+    max_svg_pixels: Option<u64>,
     /// Left out keeps the default; `null` means no deadline.
     #[serde(default, deserialize_with = "nullable")]
     timeout_ms: Option<Option<u64>>,
@@ -115,6 +116,7 @@ pub(crate) fn from_json(json: &str) -> Result<RenderOptions, Error> {
         max_pages: limits.max_pages.unwrap_or(default.max_pages),
         max_total_pages: limits.max_total_pages.unwrap_or(default.max_total_pages),
         max_image_pixels: limits.max_image_pixels.unwrap_or(default.max_image_pixels),
+        max_svg_pixels: limits.max_svg_pixels.unwrap_or(default.max_svg_pixels),
         timeout: limits
             .timeout_ms
             .map_or(default.timeout, |ms| ms.map(Duration::from_millis)),

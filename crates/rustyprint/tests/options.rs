@@ -276,6 +276,7 @@ fn schema_describes_every_option() {
             "max_input_bytes",
             "max_nodes",
             "max_pages",
+            "max_svg_pixels",
             "max_total_pages",
             "timeout_ms"
         ])

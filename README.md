@@ -138,6 +138,7 @@ Every render runs within limits, so a hostile or broken document cannot run fore
 | Pages | 2,000 | `max_pages` |
 | Pages of a whole record set | 200,000 | `max_total_pages` |
 | Image size (larger images are skipped with a warning) | 100 megapixels | `max_image_pixels` |
+| Pixels drawn for `<svg>` elements that cannot be drawn as shapes, in all (one that needs more is left blank with a warning) | 64 megapixels | `max_svg_pixels` |
 | Time | 60 seconds | `timeout_ms` (`null` for no limit) |
 
 ### Warnings and exit codes
