@@ -36,6 +36,7 @@ mod shadow;
 mod shapes;
 mod svg;
 mod svg_element;
+mod svg_shapes;
 pub mod table;
 mod text;
 mod transform;
@@ -345,6 +346,14 @@ pub fn links_and_bookmarks(
 /// backgrounds are positioned in the box's border box.
 pub fn paint_fragment(fragment: &fragment::BoxFragment, images: &Images) -> Vec<DisplayItem> {
     effects::resolve_backdrops(paint::paint(fragment, images, fragment.rect).items)
+}
+
+/// Draws display items to pixels: what they paint inside `rect`, with the engine's own
+/// drawing of filters and masks, at two pixels for each CSS pixel. `None` if `rect` is empty.
+pub fn rasterize(items: &[DisplayItem], rect: Rect) -> Option<Image> {
+    let mut raster = raster::Raster::new(rect)?;
+    raster::draw(items, &mut raster);
+    Some(raster.to_image())
 }
 
 /// The document's title for PDF metadata: the text of its first `<title>`, with whitespace

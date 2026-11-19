@@ -10,6 +10,7 @@ use rustyprint_css::ComputedValues;
 use rustyprint_css::properties::types::ImageOrientation;
 
 use crate::display::Rect;
+use crate::svg::{PixelBudget, SvgPicture};
 
 /// A decoded raster image, as stored in the file: one image pixel is one CSS pixel unless
 /// `image-resolution` says otherwise.
@@ -97,7 +98,8 @@ impl Image {
     /// most `max_pixels` pixels.
     fn decode_within(bytes: &[u8], max_pixels: u64) -> Result<Image, String> {
         if crate::svg::is_svg(bytes) {
-            return crate::svg::rasterize(bytes, max_pixels, crate::svg::Resources::default());
+            return crate::svg::rasterize(bytes, max_pixels, crate::svg::Resources::default())
+                .map(|(image, _)| image);
         }
         let orientation = exif_orientation(bytes);
         if let Some((width, height, components)) = jpeg_header(bytes)
@@ -192,6 +194,14 @@ pub fn orientation(image: &Image, value: ImageOrientation) -> u8 {
 }
 
 /// The EXIF orientation of a JPEG, TIFF or WebP file, or 1.
+/// What to warn of if the image file `bytes`, called `what`, has more than `max_pixels`
+/// pixels, as its header says before anything is decoded.
+pub(crate) fn over_limit(what: &str, bytes: &[u8], max_pixels: u64) -> Option<String> {
+    let (width, height) = dimensions(bytes)?;
+    (u64::from(width) * u64::from(height) > max_pixels)
+        .then(|| format!("{what} is {width}×{height} pixels, more than the limit of {max_pixels}"))
+}
+
 /// An image file's size in pixels, read from its header.
 fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if let Some((width, height, _)) = jpeg_header(bytes) {
@@ -439,7 +449,15 @@ pub struct Images<'a> {
     /// Images decoded for earlier documents.
     shared: Option<&'a ImageCache>,
     /// The pictures of `<svg>` elements, by their markup.
-    svgs: RefCell<HashMap<String, Option<Arc<Image>>>>,
+    svgs: RefCell<HashMap<String, Option<Arc<SvgPicture>>>>,
+    /// The files that images inside `<svg>` elements link to, by URL, each loaded once.
+    svg_files: RefCell<HashMap<String, Option<Arc<Vec<u8>>>>>,
+    /// The images inside `<svg>` elements, decoded once for each file.
+    svg_images: RefCell<HashMap<FileKey, Option<Arc<Image>>>>,
+    /// The fonts given to SVGs so far.
+    svg_fonts: crate::svg::Fonts,
+    /// The pixels left for `<svg>` elements that are drawn to pixels.
+    svg_pixels: Arc<PixelBudget>,
     /// Elements painted for `element()`, by ID.
     elements: RefCell<HashMap<String, ElementImage>>,
     /// How many `iframe` documents are being built inside each other.
@@ -464,6 +482,10 @@ impl<'a> Images<'a> {
             cache: RefCell::new(HashMap::new()),
             shared: None,
             svgs: RefCell::new(HashMap::new()),
+            svg_files: RefCell::new(HashMap::new()),
+            svg_images: RefCell::new(HashMap::new()),
+            svg_fonts: crate::svg::Fonts::default(),
+            svg_pixels: Arc::new(PixelBudget::new(u64::MAX)),
             elements: RefCell::new(HashMap::new()),
             frames: Cell::new(0),
             max_pixels: u64::MAX,
@@ -477,6 +499,20 @@ impl<'a> Images<'a> {
             max_pixels: max,
             ..self
         }
+    }
+
+    /// Draws at most `max` pixels in all for the `<svg>` elements that cannot be drawn as
+    /// shapes. One that needs more than are left is left blank, with a warning.
+    pub fn with_max_svg_pixels(self, max: u64) -> Self {
+        Self {
+            svg_pixels: Arc::new(PixelBudget::new(max)),
+            ..self
+        }
+    }
+
+    /// How many pixels `<svg>` elements have been drawn to.
+    pub fn svg_pixels(&self) -> u64 {
+        self.svg_pixels.used()
     }
 
     /// Takes the images that `shared` has kept from earlier documents instead of decoding
@@ -508,7 +544,7 @@ impl<'a> Images<'a> {
                 let key = self.shared.map(|shared| (shared, FileKey::of(&bytes)));
                 match key.and_then(|(shared, key)| shared.get(key)) {
                     Some(kept) => Some(kept),
-                    None => match Image::decode_within(&bytes, self.max_pixels) {
+                    None => match self.decode(&bytes) {
                         Ok(image) => {
                             let image = Arc::new(image);
                             if let Some((shared, key)) = key {
@@ -530,19 +566,54 @@ impl<'a> Images<'a> {
         image
     }
 
-    /// The picture of an `<svg>` element written out as the SVG file `markup`, drawn with
-    /// `resources`, or `None` with a warning if it cannot be drawn.
+    /// Decodes an image file. An SVG file is drawn to pixels, with the fonts the document
+    /// has given its SVGs so far.
+    fn decode(&self, bytes: &[u8]) -> Result<Image, String> {
+        if !crate::svg::is_svg(bytes) {
+            return Image::decode_within(bytes, self.max_pixels);
+        }
+        let resources = crate::svg::Resources {
+            fonts: self.svg_fonts.clone(),
+            ..Default::default()
+        };
+        let (image, warnings) = crate::svg::rasterize(bytes, self.max_pixels, resources)?;
+        for warning in warnings {
+            self.warn(warning);
+        }
+        Ok(image)
+    }
+
+    /// The picture of an `<svg>` element with `style`, written out as the SVG file
+    /// `markup`, whose images link to `files`. Elements with the same markup share one
+    /// picture. `None` with a warning if it cannot be drawn.
     pub(crate) fn svg_element(
         &self,
         markup: &str,
-        resources: crate::svg::Resources,
-    ) -> Option<Arc<Image>> {
+        style: &Arc<ComputedValues>,
+        files: HashMap<String, Arc<Vec<u8>>>,
+    ) -> Option<Arc<SvgPicture>> {
         if let Some(drawn) = self.svgs.borrow().get(markup) {
             return drawn.clone();
         }
         rustyprint_dom::budget::check_deadline();
-        let image = match crate::svg::rasterize(markup.as_bytes(), self.max_pixels, resources) {
-            Ok(image) => Some(Arc::new(image)),
+        let resources = crate::svg::Resources {
+            style: Some(style.clone()),
+            files,
+            fonts: self.svg_fonts.clone(),
+        };
+        let picture = match crate::svg::parse(markup.as_bytes(), self.max_pixels, resources) {
+            Ok(mut parsed) => {
+                for warning in std::mem::take(&mut parsed.warnings) {
+                    self.warn(warning);
+                }
+                Some(Arc::new(SvgPicture::new(
+                    parsed,
+                    style,
+                    &|bytes| self.svg_image(bytes),
+                    self.max_pixels,
+                    &self.svg_pixels,
+                )))
+            }
             Err(error) => {
                 self.warn(format!("could not draw an `<svg>` element: {error}"));
                 None
@@ -550,34 +621,64 @@ impl<'a> Images<'a> {
         };
         self.svgs
             .borrow_mut()
-            .insert(markup.to_owned(), image.clone());
+            .insert(markup.to_owned(), picture.clone());
+        picture
+    }
+
+    /// An image file held in an `<svg>` element, decoded once however many elements hold
+    /// it, or `None` with a warning if it cannot be decoded or has more pixels than allowed.
+    fn svg_image(&self, bytes: &[u8]) -> Option<Arc<Image>> {
+        let key = FileKey::of(bytes);
+        if let Some(known) = self.svg_images.borrow().get(&key) {
+            return known.clone();
+        }
+        const WHAT: &str = "an image in an SVG";
+        let image = match over_limit(WHAT, bytes, self.max_pixels) {
+            Some(warning) => {
+                self.warn(warning);
+                None
+            }
+            None => match Image::decode_within(bytes, self.max_pixels) {
+                Ok(image) => Some(Arc::new(image)),
+                Err(error) => {
+                    self.warn(format!("could not decode {WHAT}: {error}"));
+                    None
+                }
+            },
+        };
+        self.svg_images.borrow_mut().insert(key, image.clone());
         image
     }
 
-    /// The bytes of the image file at `url`, for an image inside another, or `None` with a
-    /// warning if it cannot be loaded or has more pixels than allowed.
-    pub(crate) fn file(&self, url: &str) -> Option<Vec<u8>> {
-        let Some(bytes) = (self.load)(url) else {
-            self.warn(format!("could not load image `{url}`"));
-            return None;
+    /// The bytes of the image file at `url`, for an image inside an `<svg>` element, loaded
+    /// once however many elements link to it. `None` with a warning if it cannot be loaded
+    /// or has more pixels than allowed.
+    pub(crate) fn file(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+        if let Some(known) = self.svg_files.borrow().get(url) {
+            return known.clone();
+        }
+        let file = match (self.load)(url) {
+            None => {
+                self.warn(format!("could not load image `{url}`"));
+                None
+            }
+            Some(bytes) => (!self.too_large(url, &bytes)).then(|| Arc::new(bytes)),
         };
-        (!self.too_large(url, &bytes)).then_some(bytes)
+        self.svg_files
+            .borrow_mut()
+            .insert(url.to_owned(), file.clone());
+        file
     }
 
     /// Whether the image in `bytes` has more pixels than allowed, which is warned about.
     fn too_large(&self, url: &str, bytes: &[u8]) -> bool {
-        let Some((width, height)) = dimensions(bytes) else {
-            return false;
-        };
-        let pixels = u64::from(width) * u64::from(height);
-        if pixels <= self.max_pixels {
-            return false;
+        match over_limit(&format!("image `{url}`"), bytes, self.max_pixels) {
+            Some(warning) => {
+                self.warn(warning);
+                true
+            }
+            None => false,
         }
-        self.warn(format!(
-            "image `{url}` is {width}×{height} pixels, more than the limit of {}",
-            self.max_pixels
-        ));
-        true
     }
 
     /// The painted element with an ID, for `element()`.
@@ -622,9 +723,11 @@ impl<'a> Images<'a> {
         }
     }
 
-    /// Problems loading images, in the order they were found.
+    /// Problems loading and drawing images, in the order they were found.
     pub fn warnings(&self) -> Vec<String> {
-        self.warnings.borrow().clone()
+        let mut warnings = self.warnings.borrow().clone();
+        warnings.extend(self.svg_pixels.warnings());
+        warnings
     }
 }
 
@@ -993,6 +1096,26 @@ mod tests {
             r#"<text x="2" y="15" font-size="12" font-family="sans-serif" font-weight="bold">Total 12%</text>"#,
         ));
         assert!(bold > regular, "{bold} pixels of bold text");
+        // Text that sets no size is 16 pixels, `medium`, as in a browser.
+        let sized = |size: &str| inked(&svg(&format!(r#"<text x="2" y="15" {size}>Total</text>"#)));
+        assert_eq!(sized(""), sized(r#"font-size="16""#));
+        assert!(sized("") > sized(r#"font-size="12""#));
+    }
+
+    #[test]
+    fn svg_files_of_a_document_share_the_fonts_given_to_them() {
+        let load = |url: &str| {
+            Some(
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text y="15">{url}</text></svg>"#
+                )
+                .into_bytes(),
+            )
+        };
+        let images = Images::new(&load);
+        assert!(images.get("one.svg").is_some() && images.get("two.svg").is_some());
+        assert!(images.warnings().is_empty());
+        assert_eq!(images.svg_fonts.given(), 1);
     }
 
     #[test]
