@@ -23,7 +23,9 @@ use rustyprint_css::StyleOptions;
 use rustyprint_css::stylesheet::Stylesheet;
 use rustyprint_dom::Document;
 use rustyprint_dom::budget::{self, Budget, Exceeded};
-use rustyprint_layout::{DeferredMargins, ImageCache, Images, LaterTotal, PageOptions};
+use rustyprint_layout::{
+    DeferredMargins, ImageCache, Images, LaterTotal, PageOptions, PixelBudget,
+};
 
 pub use assets::Assets;
 pub use options::{page_size, parse_length, parse_margin};
@@ -323,6 +325,8 @@ struct Preceding<'a> {
     pages: usize,
     /// The images those records share.
     images: Option<&'a ImageCache>,
+    /// The pixels left for the SVGs of the whole set that are drawn to pixels.
+    svg_pixels: Option<&'a Arc<PixelBudget>>,
     /// That `counter(pages)` is the number of pages of the set, known when it ends.
     total: Option<&'a LaterTotal>,
     /// The font files those records loaded.
@@ -467,9 +471,12 @@ fn lay_out_flow(
         (None, _) => get(url).map(Arc::from),
     };
     let load_file = |url: &str| get(url);
-    let images = Images::new(&load_file)
-        .with_max_pixels(options.limits.max_image_pixels)
-        .with_max_svg_pixels(options.limits.max_svg_pixels);
+    let images = Images::new(&load_file).with_max_pixels(options.limits.max_image_pixels);
+    // The records of a set draw within one limit, whatever their number.
+    let images = match preceding.svg_pixels {
+        Some(budget) => images.with_svg_budget(budget),
+        None => images.with_max_svg_pixels(options.limits.max_svg_pixels),
+    };
     let images = match preceding.images {
         Some(shared) => images.with_cache(shared),
         None => images,

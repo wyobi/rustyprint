@@ -3,13 +3,14 @@
 
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use rustyprint_css::stylesheet::Stylesheet;
 use rustyprint_dom::{NodeData, NodeId, budget, local_name};
 use rustyprint_layout::display::{ColorProfile, Document};
-use rustyprint_layout::{Carried, DeferredMargins, ImageCache, Images, LaterTotal};
+use rustyprint_layout::{Carried, DeferredMargins, ImageCache, Images, LaterTotal, PixelBudget};
 use rustyprint_pdf::{Session, Setup};
 
 use crate::{
@@ -324,6 +325,9 @@ struct Printer {
     /// The stylesheet of the options, parsed once for every record.
     stylesheet: Option<Stylesheet>,
     images: ImageCache,
+    /// The pixels left for the SVGs of the whole set that are drawn to pixels: one limit
+    /// for the set, so that its memory does not grow with its number of records.
+    svg_pixels: Arc<PixelBudget>,
     /// The font files the records loaded, each of them once.
     fonts: assets::FontFiles,
     /// The file, from the first record on. It is written to memory, a record at a time,
@@ -353,6 +357,7 @@ impl Printer {
     fn new(options: RenderOptions) -> Self {
         Self {
             stylesheet: options.stylesheet.as_deref().map(Stylesheet::parse),
+            svg_pixels: Arc::new(PixelBudget::new(options.limits.max_svg_pixels)),
             options,
             images: ImageCache::new(SHARED_IMAGE_BYTES),
             fonts: assets::FontFiles::default(),
@@ -425,6 +430,7 @@ impl Printer {
         let preceding = Preceding {
             pages: before,
             images: Some(&self.images),
+            svg_pixels: Some(&self.svg_pixels),
             total: Some(&self.total),
             fonts: Some(&self.fonts),
             stylesheet: self.stylesheet.as_ref(),
@@ -541,7 +547,7 @@ impl Printer {
         let load_file = |url: &str| loader.get(url);
         let images = Images::new(&load_file)
             .with_max_pixels(self.options.limits.max_image_pixels)
-            .with_max_svg_pixels(self.options.limits.max_svg_pixels)
+            .with_svg_budget(&self.svg_pixels)
             .with_cache(&self.images);
         for (page, margins) in std::mem::take(&mut self.deferred) {
             budget::check_deadline();

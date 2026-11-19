@@ -125,6 +125,40 @@ fn an_image_every_record_has_is_written_once() {
     assert_eq!(image_count(&pdf), 5);
 }
 
+#[test]
+fn the_records_of_a_set_draw_their_pictures_within_one_limit() {
+    // A gradient is drawn to pixels: each record's drawing is 160 × 40 of them.
+    let record = |number: usize| {
+        format!(
+            "<p>Record {number}</p><svg width='40' height='10'>\
+             <linearGradient id='paint'><stop offset='0' stop-color='#ff00{:02x}'/>\
+             <stop offset='1' stop-color='#0000ff'/></linearGradient>\
+             <rect width='40' height='10' fill='url(#paint)'/></svg>",
+            20 * number
+        )
+    };
+    let mut options = RenderOptions::default();
+    options.limits.max_svg_pixels = 3 * 160 * 40;
+    let mut set = RecordSet::open(Vec::new(), &options).unwrap();
+    for number in 0..7 {
+        let added = set.add(&record(number)).unwrap();
+        // The first three fit; each record after them says that its own was left blank.
+        if number < 3 {
+            assert_eq!(added.warnings, Vec::<String>::new(), "record {number}");
+        } else {
+            assert_eq!(added.warnings.len(), 1, "{:?}", added.warnings);
+            assert!(
+                added.warnings[0].contains("an `<svg>` element was left blank"),
+                "{:?}",
+                added.warnings
+            );
+        }
+    }
+    let (pdf, _) = set.finish().unwrap();
+    assert_eq!(page_count(&pdf), 7);
+    assert_eq!(image_count(&pdf), 3);
+}
+
 /// How many times larger a set may be than its content printed whole: a set writes the
 /// resources of every page as an object of their own.
 const MAX_SET_SIZE: f64 = 1.15;

@@ -456,8 +456,10 @@ pub struct Images<'a> {
     svg_images: RefCell<HashMap<FileKey, Option<Arc<Image>>>>,
     /// The fonts given to SVGs so far.
     svg_fonts: crate::svg::Fonts,
-    /// The pixels left for `<svg>` elements that are drawn to pixels.
+    /// The pixels left for SVGs that are drawn to pixels.
     svg_pixels: Arc<PixelBudget>,
+    /// How many drawings the budget had left blank before this document.
+    svg_refused: u64,
     /// Elements painted for `element()`, by ID.
     elements: RefCell<HashMap<String, ElementImage>>,
     /// How many `iframe` documents are being built inside each other.
@@ -486,6 +488,7 @@ impl<'a> Images<'a> {
             svg_images: RefCell::new(HashMap::new()),
             svg_fonts: crate::svg::Fonts::default(),
             svg_pixels: Arc::new(PixelBudget::new(u64::MAX)),
+            svg_refused: 0,
             elements: RefCell::new(HashMap::new()),
             frames: Cell::new(0),
             max_pixels: u64::MAX,
@@ -504,8 +507,16 @@ impl<'a> Images<'a> {
     /// Draws at most `max` pixels in all for the `<svg>` elements that cannot be drawn as
     /// shapes. One that needs more than are left is left blank, with a warning.
     pub fn with_max_svg_pixels(self, max: u64) -> Self {
+        self.with_svg_budget(&Arc::new(PixelBudget::new(max)))
+    }
+
+    /// Draws the SVGs that cannot be drawn as shapes within `budget`, which the documents
+    /// laid out one after another share, as the records of a set do: the limit is then on
+    /// all of them together.
+    pub fn with_svg_budget(self, budget: &Arc<PixelBudget>) -> Self {
         Self {
-            svg_pixels: Arc::new(PixelBudget::new(max)),
+            svg_refused: budget.refused(),
+            svg_pixels: budget.clone(),
             ..self
         }
     }
@@ -726,7 +737,10 @@ impl<'a> Images<'a> {
     /// Problems loading and drawing images, in the order they were found.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = self.warnings.borrow().clone();
-        warnings.extend(self.svg_pixels.warnings());
+        // Once for the document, however many of its drawings were left blank.
+        if self.svg_pixels.refused() > self.svg_refused {
+            warnings.push(self.svg_pixels.warning());
+        }
         warnings
     }
 }

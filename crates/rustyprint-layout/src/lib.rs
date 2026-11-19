@@ -58,6 +58,7 @@ pub use fragment::{Sides, Turn};
 pub use images::{Image, ImageCache, ImageData, Images};
 pub use margins::{DeferredMargins, LaterTotal, MarginBoxFragment};
 pub use paginate::LaidPage;
+pub use svg::PixelBudget;
 pub use text::{Glyph, shape};
 
 /// The page box: its size and margins, in CSS pixels.
