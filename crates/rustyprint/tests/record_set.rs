@@ -148,7 +148,7 @@ fn the_records_of_a_set_draw_their_pictures_within_one_limit() {
         } else {
             assert_eq!(added.warnings.len(), 1, "{:?}", added.warnings);
             assert!(
-                added.warnings[0].contains("an `<svg>` element was left blank"),
+                added.warnings[0].contains("an SVG was left blank"),
                 "{:?}",
                 added.warnings
             );
