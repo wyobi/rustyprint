@@ -460,6 +460,8 @@ pub struct Images<'a> {
     svg_pixels: Arc<PixelBudget>,
     /// How many drawings the budget had left blank before this document.
     svg_refused: u64,
+    /// How many more path segments and glyphs the document's SVGs may draw as shapes.
+    svg_shapes: Cell<u64>,
     /// Elements painted for `element()`, by ID.
     elements: RefCell<HashMap<String, ElementImage>>,
     /// How many `iframe` documents are being built inside each other.
@@ -489,6 +491,7 @@ impl<'a> Images<'a> {
             svg_fonts: crate::svg::Fonts::default(),
             svg_pixels: Arc::new(PixelBudget::new(u64::MAX)),
             svg_refused: 0,
+            svg_shapes: Cell::new(crate::svg::MAX_SHAPES),
             elements: RefCell::new(HashMap::new()),
             frames: Cell::new(0),
             max_pixels: u64::MAX,
@@ -623,6 +626,7 @@ impl<'a> Images<'a> {
                     &|bytes| self.svg_image(bytes),
                     self.max_pixels,
                     &self.svg_pixels,
+                    &self.svg_shapes,
                     &|warning| self.warn(warning),
                 )))
             }
