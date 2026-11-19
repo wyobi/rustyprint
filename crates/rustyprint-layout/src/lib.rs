@@ -396,36 +396,49 @@ pub fn overflow(pages: &[LaidPage]) -> f32 {
 
 /// Leaves out the items, and the glyphs at the end of a text run, that start at or past
 /// `edge`: a clip there hides them, and text that is not on the page should not be in the
-/// document either. What is inside a transform is kept.
+/// document either. What is inside a transform, as the text of an `<svg>` element is, is
+/// left out by where the transform puts it.
 fn cut_right(items: impl Iterator<Item = DisplayItem>, edge: f32) -> Vec<DisplayItem> {
-    // Whether each open clip or transform is a transform.
-    let mut open: Vec<bool> = Vec::new();
+    use display::{IDENTITY, apply, multiply, transform_rect};
+    // The transformation to the page inside each open clip or transform.
+    let mut open: Vec<display::Matrix> = Vec::new();
     let mut out = Vec::new();
     for mut item in items {
+        let to_page = open.last().copied().unwrap_or(IDENTITY);
         match &mut item {
-            DisplayItem::PushTransform(_) => open.push(true),
+            DisplayItem::PushTransform(matrix) => open.push(multiply(to_page, *matrix)),
             DisplayItem::PushClip(_)
             | DisplayItem::PushClipPath { .. }
-            | DisplayItem::PushClipText(_) => open.push(false),
+            | DisplayItem::PushClipText(_) => open.push(to_page),
             DisplayItem::PopClip => {
                 open.pop();
             }
-            _ if open.contains(&true) => {}
             DisplayItem::Text(run) => {
+                let y = run.origin.y;
                 let mut x = run.origin.x;
-                let visible = run.glyphs.iter().take_while(|glyph| {
-                    let starts = x;
+                let mut starts = run.glyphs.iter().map(|glyph| {
+                    let start = apply(to_page, Point::new(x, y)).x;
                     x += glyph.x_advance;
-                    starts < edge
+                    start
                 });
-                let visible = visible.count();
+                // Glyphs can only be taken off the end of a run, which is the part past
+                // the edge where the run reads towards it. A run that is turned, or
+                // mirrored, is kept whole unless all of it is past the edge.
+                let visible = if to_page[0] > 0.0 && to_page[2] == 0.0 {
+                    starts.take_while(|start| *start < edge).count()
+                } else if starts.any(|start| start < edge) {
+                    run.glyphs.len()
+                } else {
+                    0
+                };
                 if visible == 0 {
                     continue;
                 }
                 run.glyphs.truncate(visible);
             }
             other => {
-                if other.bounds().is_some_and(|bounds| bounds.x >= edge) {
+                let bounds = other.bounds().map(|bounds| transform_rect(to_page, bounds));
+                if bounds.is_some_and(|bounds| bounds.x >= edge) {
                     continue;
                 }
             }

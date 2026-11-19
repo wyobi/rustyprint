@@ -275,3 +275,36 @@ fn dashes_too_short_to_see_are_a_solid_line() {
     assert_eq!(dashes(&line("viewBox='0 0 400000 20000'", "3 3")), 0);
     assert_eq!(dashes(&line("viewBox='0 0 400000 20000'", "3000 3000")), 1);
 }
+
+#[test]
+fn text_of_a_drawing_past_the_page_that_is_cut_off_is_not_in_the_pdf() {
+    // The drawing is far wider than the page is shrunk to fit, so its right is cut off:
+    // the label there is not on the page, and so not in the file to be found or copied.
+    let html = "<style>body { margin: 0 }</style><svg width='3000' height='100'>\
+                <text x='20' y='50' font-size='20'>Nearby</text>\
+                <text transform='rotate(-90 60 80)' x='60' y='80' font-size='20'>Turned</text>\
+                <text x='2800' y='50' font-size='20'>Faraway</text>\
+                <g transform='translate(2500 0) scale(2)'>\
+                <text x='0' y='40' font-size='20'>Beyond</text></g></svg>";
+    let text_of = |shrink_to_fit: bool| {
+        let options = RenderOptions {
+            shrink_to_fit,
+            ..RenderOptions::default()
+        };
+        let output = rendered(html, &options);
+        assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+        pages(&output.pdf).remove(0).1
+    };
+    let cut = text_of(true);
+    assert!(cut.contains("Nearby") && cut.contains("Turned"), "{cut:?}");
+    assert!(
+        !cut.contains("Faraway") && !cut.contains("Beyond"),
+        "{cut:?}"
+    );
+    // A page that is not shrunk cuts nothing off: the text is there, past its edge.
+    let whole = text_of(false);
+    assert!(
+        whole.contains("Faraway") && whole.contains("Beyond"),
+        "{whole:?}"
+    );
+}
