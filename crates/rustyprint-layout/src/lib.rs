@@ -351,6 +351,10 @@ pub fn paint_fragment(fragment: &fragment::BoxFragment, images: &Images) -> Vec<
 
 /// Draws display items to pixels: what they paint inside `rect`, with the engine's own
 /// drawing of filters and masks, at two pixels for each CSS pixel. `None` if `rect` is empty.
+///
+/// For the tests of this crate, which look at what a drawing shows: it is not part of the
+/// documented API, and nothing else may depend on it.
+#[doc(hidden)]
 pub fn rasterize(items: &[DisplayItem], rect: Rect) -> Option<Image> {
     let mut raster = raster::Raster::new(rect)?;
     raster::draw(items, &mut raster);
