@@ -4,6 +4,10 @@
 
 use std::io::Cursor;
 
+use lopdf::Object;
+use lopdf::content::Content;
+use rustyprint::{RecordSet, RenderOptions};
+
 /// CSS pixels per millimetre.
 pub const MM: f32 = 96.0 / 25.4;
 
@@ -134,4 +138,92 @@ pub fn varied_documents() -> Vec<String> {
             "<tr><td>cell</td><td>cell</td></tr>".repeat(80)
         ),
     ]
+}
+
+/// What a page paints: every operation of its content, in order.
+pub type Painted = Vec<(String, Vec<Object>)>;
+
+/// The text and the content of each page of a PDF file.
+pub fn pages(pdf: &[u8]) -> Vec<(String, Painted)> {
+    let document = lopdf::Document::load_mem(pdf).expect("valid PDF");
+    let pages = document.get_pages();
+    pages
+        .iter()
+        .map(|(&number, &id)| {
+            let text = document.extract_text(&[number]).expect("the page has text");
+            let content = document.get_page_content(id);
+            let content = Content::decode(&content).expect("the content decodes");
+            let painted = content.operations.into_iter();
+            (text, painted.map(|o| (o.operator, o.operands)).collect())
+        })
+        .collect()
+}
+
+pub fn number(object: &Object) -> Option<f32> {
+    match object {
+        Object::Integer(value) => Some(*value as f32),
+        Object::Real(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Whether two operands are the same, with numbers no further apart than half a point.
+/// Shown text is as many glyphs: a font's glyphs are numbered in the order a file first
+/// uses them, which is not the same in a file whose pages are painted a piece at a time,
+/// and what the glyphs read is compared as the text of the page.
+pub fn same(a: &Object, b: &Object) -> bool {
+    match (number(a), number(b), a, b) {
+        (Some(a), Some(b), ..) => (a - b).abs() <= 0.5,
+        (_, _, Object::String(a, _), Object::String(b, _)) => a.len() == b.len(),
+        (_, _, Object::Array(a), Object::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
+        }
+        _ => a == b,
+    }
+}
+
+/// Fails unless `pieces` is `whole`: the same pages, with the same text and the same
+/// content on each, every box, border, background and line of text in the same place
+/// within half a point.
+pub fn assert_same_print(pieces: &[u8], whole: &[u8]) {
+    let (pieces, whole) = (pages(pieces), pages(whole));
+    assert_eq!(pieces.len(), whole.len(), "pages");
+    for (index, ((text, painted), (whole_text, whole_painted))) in
+        pieces.iter().zip(&whole).enumerate()
+    {
+        let page = index + 1;
+        assert_eq!(text, whole_text, "the text of page {page}");
+        assert_eq!(
+            painted.len(),
+            whole_painted.len(),
+            "how much page {page} paints"
+        );
+        for (at, (a, b)) in painted.iter().zip(whole_painted).enumerate() {
+            let alike = a.0 == b.0
+                && a.1.len() == b.1.len()
+                && a.1.iter().zip(&b.1).all(|(a, b)| same(a, b));
+            assert!(alike, "page {page}, operation {at}: {a:?} is not {b:?}");
+        }
+    }
+}
+
+/// Prints `pieces` as one flow: the first as a record, the others continuing it.
+pub fn print_pieces(pieces: &[String], options: &RenderOptions) -> Vec<u8> {
+    let mut set = RecordSet::open(Vec::new(), options).unwrap();
+    for (index, piece) in pieces.iter().enumerate() {
+        let added = if index == 0 {
+            set.add(piece)
+        } else {
+            set.add_continuing(piece)
+        };
+        assert_eq!(
+            added.unwrap().warnings,
+            Vec::<String>::new(),
+            "piece {index}"
+        );
+    }
+    let (pdf, summary) = set.finish().unwrap();
+    assert_eq!(summary.pages, page_count(&pdf));
+    assert_eq!(summary.records, pieces.len());
+    pdf
 }
