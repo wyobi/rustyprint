@@ -192,7 +192,13 @@ fn two_hundred_thousand_rows_in_boxes_for_the_numbers() {
         .and_then(|rows| rows.parse().ok())
         .unwrap_or(rows);
     let whole = whole(whole_rows);
-    let (pdf, growth, time) = growth_while(|| render(&whole, &options()));
+    // The whole document is over the default limits, which a document in pieces is not.
+    let mut unlimited = options();
+    unlimited.limits.max_input_bytes = usize::MAX;
+    unlimited.limits.max_nodes = usize::MAX;
+    unlimited.limits.max_pages = usize::MAX;
+    unlimited.limits.timeout = None;
+    let (pdf, growth, time) = growth_while(|| render(&whole, &unlimited));
     let bytes = pdf.map(|output| output.pdf.len());
     println!("{whole_rows} rows whole: the process grew by {growth} KB in {time:?}: {bytes:?}");
 }
