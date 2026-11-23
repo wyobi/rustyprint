@@ -101,8 +101,19 @@ const pdf = toReadable(set, async () => {
 })
 ```
 
-- **The table rule.** A piece that starts with `<table data-rp-continue>` gives the rows of its `<tbody>` to the table that the record before it ended with, which has to be the last thing in that record and a child of `<body>`. The rows go straight under the rows before them. The table keeps the `<colgroup>`, `<thead>`, `<tfoot>` and column widths of its first piece, and the header and footer repeat on every page, as in a table printed whole; those of a later piece are not used. A table without the attribute is a table of its own. With the attribute and no table to continue, it is a table of its own as well, with a warning. Rows with more columns than the table started with fail the `add`.
-- **Column widths** are those of the first piece. For `table-layout: fixed`, and for an automatic table whose widths its first rows or its `<col>` elements decide, they are the widths of the table printed whole; wider content in a later piece wraps.
+- **Open elements.** `<body>` is open, and so is the last child of an open element when nothing but white space and comments follows it: what the HTML of the flow so far leaves unclosed. The *open table* is the first `<table>` among them, at any depth; one in a cell of it is not.
+- **The table rule.** A piece that starts with `<table data-rp-continue>` gives the rows of its `<tbody>` to the open table. The rows go straight under the rows before them. The open table and the elements it is in have to be blocks among blocks, whose sizes do not depend on the rows: `display: block`, `flow-root` or `list-item`, not floated or absolutely positioned, no `width` of `min-content`, `max-content`, `fit-content` or `calc-size()`, and not in a flex, grid, table or multi-column box; otherwise the `add` fails with a `RecordSetError` naming the element. The table keeps the `<colgroup>`, `<thead>`, `<tfoot>` and column widths of its first piece, and the header and footer repeat on every page, as in a table printed whole; those of a later piece are not used. A table without the attribute is a table of its own. With the attribute and no open table, it is a table of its own as well, with a warning. Rows with more columns than the table started with fail the `add`.
+- **The rest of the document.** An element with `data-rp-continue` at the start of a piece stands for the open child of `<body>` of its name, and its content goes into that one; one at the start of that content stands for the open element below, and so on. Its attributes are not used; with no open element of its name at its place it is an element of its own, with a warning. To print a dashboard whose big table is inside widgets, cut it at the table:
+
+  ```js
+  await set.add(`<style>${css}</style><div class="page"><div class="widget"><table>${header}<tbody>${firstRows}`)
+  for await (const rows of moreRows) {
+    await set.add(`<style>${css}</style><table data-rp-continue><tbody>${rows}</tbody></table>`, { continue: true })
+  }
+  // One start tag per element the table is in, then the HTML after </table> as it is.
+  await set.add(`<style>${css}</style><div data-rp-continue><div data-rp-continue>${htmlAfterTable}`, { continue: true })
+  ```
+- **Column widths** are those of the first piece, at any depth; the boxes around the table have the widths of the whole document. For `table-layout: fixed`, and for an automatic table whose widths its first rows or its `<col>` elements decide, they are the widths of the table printed whole; wider content in a later piece wraps.
 - **What carries on:** collapsed borders, `:nth-child()` and `:nth-of-type()` stripes, `:first-child`, sibling selectors, `counter-increment` counters, page numbers and `counter(pages)`.
 - **Styles** are those of the record that started: a `<style>` in the `<head>` of a piece that continues is not used, with a warning unless it is one the first record had.
 - **The open page.** What the last page of a record paints is written by the next call, or by `finish`, since a piece that continues may add to it: `add` resolves to the bytes written so far, and `pages` of a piece that continues is the pages it started, which is none when it fits on the open page.

@@ -256,7 +256,16 @@ rp_status rp_record_set_add(struct rp_record_set *set, const char *html, size_t 
  * follows that record's on the same page, as if it were at the end of that record's
  * `<body>`, so a document can be printed a piece at a time and come out as it does printed
  * whole. A piece that starts with `<table data-rp-continue>` adds the rows of that table to
- * the table the record before ended with, which keeps its columns, header and footer.
+ * the open table, which keeps its columns, header and footer: the first `<table>` among the
+ * open elements, which are `<body>` and the last child of an open element when nothing but
+ * white space and comments follows it, at any depth. It and the elements it is in have to
+ * be blocks among blocks (`display: block`, `flow-root` or `list-item`, not floated or
+ * absolutely positioned, no content-sized `width`, not in a flex, grid, table or
+ * multi-column box), or the call fails with `RP_STATUS_RECORD_SET`. An element with
+ * `data-rp-continue` at the start of a piece's `<body>`, or at the start of such an
+ * element, stands for the open element of its name at that place, and its content is added
+ * to that one's: so the rest of a document after a table is one start tag with
+ * `data-rp-continue` per element the table is in, then the HTML after its `</table>`.
  * `rp_record_set_added_pages` is then the pages the piece started, which is none when it
  * fits on the open page. Everything else is as `rp_record_set_add` has it; the first record
  * of a set can be added either way.

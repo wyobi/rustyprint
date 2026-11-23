@@ -117,9 +117,16 @@ export interface AddOptions {
    * content follows that record's on the same page, as if it were at the end of that record's
    * `<body>`, so a document printed a piece at a time comes out as it does printed whole. A
    * piece that starts with `<table data-rp-continue>` adds the rows of that table's `<tbody>` to
-   * the table that the record before ended with, which keeps its column widths, header and
-   * footer; its own `<colgroup>`, `<thead>` and `<tfoot>` are not used. The styles are those of
-   * the record that started. Default: false, so the record starts on a new page.
+   * the open table, which keeps its column widths, header and footer; its own `<colgroup>`,
+   * `<thead>` and `<tfoot>` are not used. The open table is the first `<table>` among the open
+   * elements: `<body>`, and the last child of an open element when nothing but white space and
+   * comments follows it, at any depth. It and the elements it is in have to be blocks among
+   * blocks (not flex, grid, table, multi-column, floated, positioned or content-sized boxes),
+   * or the call rejects with a `RecordSetError`. An element with `data-rp-continue` at the start
+   * of a piece, or at the start of such an element, stands for the open element of its name at
+   * that place, and its content goes into that one: the rest of a document after a table is one
+   * such start tag per element the table is in, then the HTML after its `</table>`. The styles
+   * are those of the record that started. Default: false, so the record starts on a new page.
    */
   continue?: boolean
 }
