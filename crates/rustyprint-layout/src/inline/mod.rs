@@ -341,15 +341,30 @@ pub(crate) fn line_height(style: &ComputedValues) -> f32 {
 
 /// Minimum and maximum content widths of inline content (CSS Sizing 3 § 5).
 pub(crate) fn intrinsic(items: &[InlineItem], container: &Arc<ComputedValues>) -> (f32, f32) {
+    intrinsic_beside(items, container, 0.0)
+}
+
+/// Minimum and maximum content widths of inline content whose first line has floats from
+/// before the content beside it, `beside` wide together. At its widest that line needs room
+/// for them too.
+pub(crate) fn intrinsic_beside(
+    items: &[InlineItem],
+    container: &Arc<ComputedValues>,
+    beside: f32,
+) -> (f32, f32) {
     let indent = container.text_indent.length.resolve(0.0);
     let has_atomics = items.iter().any(|i| matches!(i, InlineItem::Atomic(_)));
     let p = Paragraph::build(items, container, 0.0, 0.0);
     let (min, max) = Breaker::new(&p).intrinsic(indent);
+    // The floats take room at the start of the first line, as an indent does.
+    let start = indent + beside;
     let (min, max) = if has_atomics {
         // Atomic inlines are as narrow as they get for the minimum and unconstrained for the
         // maximum.
         let wide = Paragraph::build(items, container, UNLIMITED, 0.0);
-        (min, Breaker::new(&wide).intrinsic(indent).1)
+        (min, Breaker::new(&wide).intrinsic(start).1)
+    } else if beside > 0.0 {
+        (min, Breaker::new(&p).intrinsic(start).1)
     } else {
         (min, max)
     };
