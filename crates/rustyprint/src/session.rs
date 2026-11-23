@@ -18,9 +18,10 @@ use crate::{
     check_input_size, check_scale, exceeded, lay_out_flow, limit_error, panic_message, parse,
 };
 
-/// The attribute of a `<table>` at the start of a piece that continues: its rows are
-/// more rows of the table that the piece before ended with.
-const CONTINUES_TABLE: &str = "data-rp-continue";
+/// The attribute of an element at the start of a piece that continues, or at the start of
+/// such an element: it stands for the open element of the flow at its place, and what is
+/// in it is added to that one. On a `<table>`, its rows are more rows of the open table.
+const CONTINUES: &str = "data-rp-continue";
 
 /// The decoded pixels a set keeps, at the most, of the images that its records share and
 /// of the SVGs it drew to pixels.
@@ -30,7 +31,8 @@ const SHARED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Added {
     /// How many pages the record added to the set: the pages it took, or for one that
-    /// continues on the page of the record before it, the pages it started.
+    /// continues on the page of the record before it, the pages it started. A record that
+    /// ends a flow adds the flow's last pages as well, when they waited for more of it.
     pub pages: usize,
     /// Problems found in the record's CSS, as `source:line: message`, and problems loading
     /// its images.
@@ -107,19 +109,47 @@ pub struct Summary {
 /// - The last page of a flow is open: it is a page of the file, and what it paints is
 ///   written when it is full, when a record that does not continue is added, or when the
 ///   set is finished. Between two calls the set holds what that page paints, and the part
-///   of the flow's document that is on it or after it.
+///   of the flow's document that is on it or after it. The open page is the page the last
+///   element of the flow so far starts on: pages after it that hold only the ends of the
+///   elements that are still open, such as their bottom padding, borders and margins,
+///   which more content would push on, are laid out again with the next piece, and are
+///   written when the flow ends.
+/// - The *open* elements of a flow are `<body>`, and the last child of an open element when
+///   nothing but white space and comments follows it: the elements that the HTML of the
+///   flow so far leaves unclosed. The *open table* is the first `<table>` among them, at any
+///   depth below `<body>`; a table in one of its cells is not.
 /// - A piece that starts with `<table data-rp-continue>` adds the rows of that table's
-///   `<tbody>` elements to the last `<tbody>` of the table that the flow ends with, which
-///   has to be the last thing in the flow so far and a child of `<body>`. The `<colgroup>`,
-///   `<thead>`, `<tfoot>` and `<caption>` of the piece's table are not used: the table keeps
-///   those of its first piece, and the header and footer repeat on every page as they do
-///   in a table printed whole. Without the attribute a table is a table of its own. With
-///   it and no table to continue, it is a table of its own too, with a warning.
-/// - A table that is a child of `<body>` keeps the column widths it had when it was first
-///   laid out. For `table-layout: fixed`, and for an automatic table whose widths its first
-///   rows or its `<col>` elements decide, those are the widths of the table printed whole;
-///   wider content in later rows wraps in the columns as they are. Rows with more columns
-///   than the table started with fail the `add`.
+///   `<tbody>` elements to the last `<tbody>` of the open table. The open table and the
+///   elements it is in have to be blocks among blocks, whose sizes do not depend on the
+///   rows: `display: block`, `flow-root` or `list-item`, not floated or absolutely
+///   positioned, with no `width` of `min-content`, `max-content`, `fit-content` or
+///   `calc-size()`, and not in a flex, grid, table or multi-column box. Then the rows are
+///   laid out where they are in the document printed whole; otherwise the `add` fails, and
+///   says which element is in the way. The `<colgroup>`, `<thead>`, `<tfoot>` and
+///   `<caption>` of the piece's table are not used: the table keeps those of its first
+///   piece, and the header and footer repeat on every page as they do in a table printed
+///   whole. Without the attribute a table is a table of its own. With it and no open table,
+///   it is a table of its own too, with a warning.
+/// - A piece goes on inside the open elements when its `<body>` starts with an element
+///   with `data-rp-continue` of the same name as the open child of `<body>`: that element
+///   stands for the open one, and its content is added to the open one's, after what that
+///   has. An element with `data-rp-continue` at the start of that content stands for the
+///   open element below, and so on; a `<table data-rp-continue>` there gives its rows to the
+///   open table, if that is the open element at its place. The attributes of an element
+///   that stands in are not used. One without an open element of its name at its place is
+///   an element of its own, with a warning. So any document prints a piece at a time as it
+///   does whole when it is cut at a table into: the document up to the first rows of the
+///   table, cut off there; `<table data-rp-continue>` pieces of the other rows; and the
+///   rest, which is a start tag with `data-rp-continue` for each element the table is in,
+///   from `<body>` down, followed by the HTML after the table's `</table>`, whose end tags
+///   close those elements.
+/// - A table in block boxes, at any depth, keeps the column widths it had when it was
+///   first laid out. For `table-layout: fixed`, and for an automatic table whose widths its
+///   first rows or its `<col>` elements decide, those are the widths of the table printed
+///   whole; wider content in later rows wraps in the columns as they are. The boxes it is
+///   in, of a fixed or percentage width or `auto`, have the widths of the whole document,
+///   since those do not depend on the rows. Rows with more columns than the table started
+///   with fail the `add`.
 /// - Collapsed borders, `:nth-child()`, `:nth-of-type()`, `:first-child`, sibling
 ///   combinators, and counters that the rows add to with `counter-increment` carry on over
 ///   the pieces. `:nth-child(… of S)` counts the rows that are let go of as matching `S`,
@@ -223,7 +253,8 @@ impl<W: Write> RecordSet<W> {
     pub fn finish(mut self) -> Result<(W, Summary), Error> {
         self.usable()?;
         let written = self.worker.ask(Work::Finish)?;
-        self.write(written)?;
+        let written = self.write(written)?;
+        self.pages += written.pages;
         self.writer.flush().map_err(write_error)?;
         let summary = Summary {
             pages: self.pages,
@@ -357,6 +388,9 @@ struct Flow {
     fit: Fit,
     /// The margin boxes of the open page that wait for the number of pages.
     deferred: Option<DeferredMargins>,
+    /// Whether pages after the open page wait for more content: they have only the ends
+    /// of the elements that are still open, and are laid out again when the flow ends.
+    waits: bool,
 }
 
 impl Printer {
@@ -413,22 +447,45 @@ impl Printer {
         self.images.next_document();
         let piece = parse(html);
         let mut warnings = Vec::new();
+        let mut ended = None;
         // A piece that continues is added to the document of its flow, which is laid out
         // again from its open page. Any other record ends the flow before it.
-        let (mut document, carried) = match self.flow.take() {
+        let (document, carried) = match self.flow.take() {
             Some(flow) if continues => {
                 let mut document = flow.document;
-                let table = flow.carried.last_table(&document);
-                warnings.extend(append(&mut document, &piece, table));
+                let table = flow.carried.open_table();
+                warnings.extend(append(&mut document, &piece, &table)?);
                 budget::check_document(&document);
                 (document, Some((flow.carried, flow.fit)))
             }
             Some(flow) => {
-                self.end(flow);
+                ended = Some(self.end(flow)?);
                 (piece, None)
             }
             None => (piece, None),
         };
+        let mut written = self.print(document, carried, true)?;
+        warnings.append(&mut written.warnings);
+        // The pages of the flow that this record ends come before its own.
+        let (pages, mut bytes) = ended.map_or((0, Vec::new()), |ended| (ended.pages, ended.bytes));
+        bytes.append(&mut written.bytes);
+        Ok(Written {
+            pages: written.pages + pages,
+            warnings,
+            bytes,
+        })
+    }
+
+    /// Lays out and writes `document`, a record or, with `carried`, the document of a flow
+    /// from its open page on. With `open`, the flow goes on: its open page is kept open,
+    /// and the pages after it that have only the ends of elements that are still open are
+    /// left to be laid out again. Without it, the flow ends, and its pages are its last.
+    fn print(
+        &mut self,
+        mut document: rustyprint_dom::Document,
+        carried: Option<(Carried, Fit)>,
+        open: bool,
+    ) -> Result<Written, Error> {
         // The open page of a flow that carries on is laid out again: it is the first page
         // of this record.
         let written = self.session.as_ref().map_or(0, Session::page_count);
@@ -443,12 +500,16 @@ impl Printer {
         };
         let kept = carried.as_ref().map(|(carried, fit)| (carried, *fit));
         let LaidFlow {
-            laid_out: (record, laid_warnings, deferred),
-            open,
+            laid_out: (mut record, warnings, mut deferred),
+            open: laid,
             fit,
         } = lay_out_flow(&document, &self.options, &preceding, kept)?;
-        warnings.extend(laid_warnings);
-        let pages = record.pages.len();
+        let laid_pages = record.pages.len();
+        let pages = if open { laid.pages() } else { laid_pages };
+        let waits = pages < laid_pages;
+        record.pages.truncate(pages);
+        record.bookmarks.retain(|mark| mark.target.page < pages);
+        deferred.retain(|(page, _)| *page < pages);
         let max = self.options.limits.max_total_pages;
         if before + pages > max {
             return Err(exceeded(Limit::TotalPages, max));
@@ -466,19 +527,22 @@ impl Printer {
         let bytes = std::mem::take(session.get_mut());
         let mut open_deferred = None;
         for (page, margins) in deferred {
-            if page == last {
+            if page == last && open {
                 open_deferred = Some(margins);
             } else {
                 self.deferred.push((before + page, margins));
             }
         }
-        let carried = rustyprint_layout::let_go(&mut document, open);
-        self.flow = Some(Flow {
-            document,
-            carried,
-            fit,
-            deferred: open_deferred,
-        });
+        if open {
+            let carried = rustyprint_layout::let_go(&mut document, laid);
+            self.flow = Some(Flow {
+                document,
+                carried,
+                fit,
+                deferred: open_deferred,
+                waits,
+            });
+        }
         Ok(Written {
             // The open page of a flow is counted with the record that started the flow.
             pages: if continued { last } else { pages },
@@ -487,13 +551,23 @@ impl Printer {
         })
     }
 
-    /// Ends a flow: the margin boxes of its open page are those the page has for good.
-    fn end(&mut self, flow: Flow) {
+    /// Ends a flow: the pages after its open page that waited for more content are laid
+    /// out again without it and written, and the margin boxes of its last page are those
+    /// the page has for good.
+    fn end(&mut self, flow: Flow) -> Result<Written, Error> {
+        if flow.waits {
+            return self.print(flow.document, Some((flow.carried, flow.fit)), false);
+        }
         let page = self.session.as_ref().map_or(0, Session::page_count);
         let margins = flow
             .deferred
             .map(|margins| (page.saturating_sub(1), margins));
         self.deferred.extend(margins);
+        Ok(Written {
+            pages: 0,
+            warnings: Vec::new(),
+            bytes: Vec::new(),
+        })
     }
 
     /// The file, started with the title and color profiles of `record` if it is the
@@ -521,9 +595,11 @@ impl Printer {
     }
 
     fn finish(&mut self) -> Result<Written, Error> {
-        if let Some(flow) = self.flow.take() {
-            self.end(flow);
-        }
+        let ended = match self.flow.take() {
+            Some(flow) => Some(self.end(flow)?),
+            None => None,
+        };
+        let (pages, mut bytes) = ended.map_or((0, Vec::new()), |ended| (ended.pages, ended.bytes));
         let mut session = match self.session.take() {
             Some(session) => session,
             None => {
@@ -536,10 +612,11 @@ impl Printer {
         };
         session.close_open_page().map_err(internal)?;
         self.paint_deferred(&mut session)?;
+        bytes.append(&mut session.finish().map_err(internal)?);
         Ok(Written {
-            pages: 0,
+            pages,
             warnings: Vec::new(),
-            bytes: session.finish().map_err(internal)?,
+            bytes,
         })
     }
 }
@@ -597,18 +674,19 @@ fn stylesheets(document: &rustyprint_dom::Document, within: Option<NodeId>) -> V
 }
 
 /// Adds the content of `piece` to the end of `document`, the document of the flow that
-/// the piece continues, and returns the warnings of doing so. `table` is the table the
-/// flow ends with, if it ends with one: a `<table data-rp-continue>` that the piece starts
-/// with gives its rows to that table.
+/// the piece continues, and returns the warnings of doing so. `table` is the open table of
+/// the flow, if it has one, or why rows cannot be added to it: a `<table data-rp-continue>`
+/// that the piece starts with gives its rows to that table. Fails when the piece has rows
+/// for a table that cannot have them.
 fn append(
     document: &mut rustyprint_dom::Document,
     piece: &rustyprint_dom::Document,
-    table: Option<NodeId>,
-) -> Vec<String> {
+    table: &Result<Option<NodeId>, String>,
+) -> Result<Vec<String>, Error> {
     let mut warnings = Vec::new();
     let (Some(body), Some(from)) = (body_of(document), body_of(piece)) else {
         warnings.push("a record that continues was not added: a document has no <body>".into());
-        return warnings;
+        return Ok(warnings);
     };
     let known = stylesheets(document, None);
     let head = piece.find_html(&local_name!("head"));
@@ -620,34 +698,80 @@ fn append(
                 .into(),
         );
     }
-    let mut started = false;
-    for child in piece.children(from) {
-        let blank = match piece.node(child).data() {
-            NodeData::Text(text) => text.trim().is_empty(),
-            NodeData::Element(_) => false,
-            _ => true,
-        };
-        let first = !started && !blank;
-        started |= !blank;
-        let continues = first
-            && piece
+    let mut adding = Adding {
+        document,
+        piece,
+        table,
+        warnings,
+    };
+    adding.children(body, from, true)?;
+    Ok(adding.warnings)
+}
+
+/// The content of a piece being added to the document of its flow.
+struct Adding<'a> {
+    document: &'a mut rustyprint_dom::Document,
+    piece: &'a rustyprint_dom::Document,
+    table: &'a Result<Option<NodeId>, String>,
+    warnings: Vec<String>,
+}
+
+impl Adding<'_> {
+    /// Adds the children of `from`, an element of the piece, to `parent`, an open element
+    /// of the flow, which is `<body>` when `body` is true. A child that the content of
+    /// `from` starts with and that has [`CONTINUES`] stands for the open element of
+    /// `parent`: its own children are added to that one.
+    fn children(&mut self, parent: NodeId, from: NodeId, body: bool) -> Result<(), Error> {
+        let piece = self.piece;
+        let mut started = false;
+        for child in piece.children(from) {
+            let blank = match piece.node(child).data() {
+                NodeData::Text(text) => text.trim().is_empty(),
+                NodeData::Element(_) => false,
+                _ => true,
+            };
+            let first = !started && !blank;
+            started |= !blank;
+            let stands_in = piece
                 .element(child)
-                .is_some_and(|e| e.is_html(&local_name!("table")) && e.has_attr(CONTINUES_TABLE));
-        match (continues, table) {
-            (true, Some(table)) => add_rows(document, table, piece, child),
-            (true, None) => {
-                warnings.push(format!(
-                    "{CONTINUES_TABLE}: the record before does not end with a table that is a \
-                     child of <body>, so this table is one of its own"
-                ));
-                document.adopt(body, piece, child);
+                .filter(|e| first && e.has_attr(CONTINUES));
+            let Some(element) = stands_in else {
+                self.document.adopt(parent, piece, child);
+                continue;
+            };
+            let open = rustyprint_layout::open_element(self.document, parent);
+            if element.is_html(&local_name!("table")) {
+                let table = self.table.clone().map_err(|reason| {
+                    Error::RecordSet(format!("{CONTINUES}: rows cannot be added: {reason}"))
+                })?;
+                // At the start of a piece, a table stands for the open table at any depth.
+                match table.filter(|&table| body || open == Some(table)) {
+                    Some(table) => add_rows(self.document, table, piece, child),
+                    None => self.on_its_own(parent, child, "table"),
+                }
+                continue;
             }
-            (false, _) => {
-                document.adopt(body, piece, child);
+            let same = open.filter(|&open| {
+                let name = self.document.element(open).map(|e| &e.name);
+                name == Some(&element.name)
+            });
+            match same {
+                Some(open) => self.children(open, child, false)?,
+                None => self.on_its_own(parent, child, &element.name.local),
             }
         }
+        Ok(())
     }
-    warnings
+
+    /// Adds `child`, a [`CONTINUES`] element of the piece with nothing to continue, as an
+    /// element of its own.
+    fn on_its_own(&mut self, parent: NodeId, child: NodeId, name: &str) {
+        self.warnings.push(format!(
+            "{CONTINUES}: the flow does not end with an open <{name}> where this <{name}> \
+             is, so it is one of its own"
+        ));
+        self.document.adopt(parent, self.piece, child);
+    }
 }
 
 /// Adds the rows of the `<tbody>` elements of `from`, a table of `piece`, to the last

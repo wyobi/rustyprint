@@ -47,7 +47,7 @@ use rustyprint_css::page::PageOrientation;
 use rustyprint_css::{ContainerSizes, StyleOptions, Styles, compute_styles_in};
 use rustyprint_dom::{Document, local_name};
 
-pub use carry::{Carried, Open, let_go};
+pub use carry::{Carried, Open, let_go, open_element};
 pub use display::{
     Bookmark, Color, Destination, DisplayItem, FillRule, Link, LinkTarget, Page, Path, PathSegment,
     Point, Rect, Size, TextRun, TextStroke, Upright,
@@ -263,7 +263,10 @@ pub fn layout_pages_after(
 /// ([`let_go`]), adds the next piece to the document and lays it out again with what it
 /// kept, as `carried`. The pages are then those from the open page on, which is laid out
 /// again with the content that was added, and `before` is how many pages come before that
-/// page. A table that is a child of `<body>` keeps the columns it was first laid out with.
+/// page. The open page is the one the last element of the document starts on: the pages
+/// after it, if there are any, have only the ends of the elements that are still open,
+/// which more content would push on ([`Open::pages`]). A table in block boxes, at any depth below `<body>`, keeps the columns it was
+/// first laid out with.
 ///
 /// Fails when the document cannot carry on where it was: when rows added to a table have
 /// more columns than the table was laid out with.
@@ -282,13 +285,20 @@ pub fn layout_flow(
         mut pages,
         mut starts,
     } = paginated(document, styles, page, images, before, carried)?;
-    let flow_pages = carried.map_or(0, Carried::flow_pages) + pages.len().saturating_sub(1);
+    let order: std::collections::HashMap<_, _> = document
+        .descendants(document.root())
+        .enumerate()
+        .map(|(index, node)| (node, index))
+        .collect();
+    let kept = carry::kept_pages(&order, &pages);
+    let flow_pages = carried.map_or(0, Carried::flow_pages) + kept.saturating_sub(1);
+    starts.truncate(kept);
     let open = carry::open(
         document,
         styles,
         &built.root,
         carried,
-        starts.pop().flatten(),
+        (starts.pop().flatten(), kept),
         flow_pages,
     );
     if later.is_some() && built.uses_total {
@@ -297,11 +307,6 @@ pub fn layout_flow(
         );
     }
     let running = built.running;
-    let order: std::collections::HashMap<_, _> = document
-        .descendants(document.root())
-        .enumerate()
-        .map(|(index, node)| (node, index))
-        .collect();
     // What comes before the element that an open page starts in is on earlier pages.
     let earlier = carried
         .and_then(Carried::starts_in)
