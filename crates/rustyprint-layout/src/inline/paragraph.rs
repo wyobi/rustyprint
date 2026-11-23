@@ -18,7 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::boxes::{BlockBox, InlineItem};
 use crate::display::Upright;
 use crate::fonts::{self, FontChoice, select};
-use crate::fragment::{BoxFragment, Sides};
+use crate::fragment::{BoxFragment, Cut, Sides};
 use crate::text::{Feature, Glyph, ShapeOptions, shape_range};
 use crate::{Font, flow};
 
@@ -739,6 +739,7 @@ impl Builder {
                 legend: None,
                 out_of_flow: None,
                 split: None,
+                cut: Cut::default(),
             },
             width: 0.0,
             height: 0.0,

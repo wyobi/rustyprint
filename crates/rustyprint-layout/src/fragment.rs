@@ -43,6 +43,8 @@ pub struct BoxFragment {
     /// of the whole box: up to the end of its page, or its own height on the box's last
     /// page. Set until the pages are laid out and the box's out-of-flow boxes are placed.
     pub split: Option<f32>,
+    /// The edges where a page or column break cut the box.
+    pub cut: Cut,
 }
 
 /// The box of an out-of-flow placeholder.
@@ -303,6 +305,40 @@ impl Sides {
 
     pub fn vertical(&self) -> f32 {
         self.top + self.bottom
+    }
+}
+
+/// The edges of a box fragment that a break cut with `box-decoration-break: slice`, where
+/// the box is drawn open, as if sliced from the unbroken box: square corners, no shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Cut {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Cut {
+    /// Whether any edge is cut.
+    pub fn any(self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+
+    /// The edges after `turn`.
+    pub fn turned(self, turn: Turn) -> Cut {
+        let flag = |cut: bool| f32::from(u8::from(cut));
+        let sides = turn.sides(Sides {
+            top: flag(self.top),
+            right: flag(self.right),
+            bottom: flag(self.bottom),
+            left: flag(self.left),
+        });
+        Cut {
+            top: sides.top > 0.0,
+            right: sides.right > 0.0,
+            bottom: sides.bottom > 0.0,
+            left: sides.left > 0.0,
+        }
     }
 }
 

@@ -228,6 +228,33 @@ fn a_second_table_later_in_the_document_is_continued_too() {
     assert_cut_prints_as_whole(&style, &parts, 35);
 }
 
+#[test]
+fn boxes_whose_ends_go_to_the_next_page_print_as_the_whole_document() {
+    // The boxes end in 432px of padding and borders, and spacers 300px apart move the end
+    // of the table down the page, so that for one of them at least the ends do not fit
+    // under the last rows: they go to the next page, alone or with rows.
+    let style = format!(
+        "{CELLS} .box {{ border: 4px solid #a00; padding: 12px 12px 200px; background: #eef }}"
+    );
+    for spacer in [
+        "<div></div>",
+        "<div style='height: 300px'></div>",
+        "<div style='height: 600px'></div>",
+    ] {
+        let parts = [
+            Part::Html(spacer),
+            Part::Html("<div class='box'><div class='box'>"),
+            Part::Table {
+                within: &["div", "div"],
+                top: HEAD,
+                rows: rows(90),
+            },
+            Part::Html("</div></div>"),
+        ];
+        assert_cut_prints_as_whole(&style, &parts, 40);
+    }
+}
+
 /// Adds the first piece of `parts`, then the next, which has rows for its table, and
 /// returns what adding the rows did.
 fn add_rows_to(style: &str, parts: &[Part]) -> Result<rustyprint::Added, Error> {
