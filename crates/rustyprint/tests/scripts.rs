@@ -1,6 +1,9 @@
 //! Chinese and Arabic text in the PDF, with the bundled fonts: copied text gives the
-//! original characters.
+//! original characters; the marks `text-overflow` adds fall back to other fonts as text does.
 
+mod common;
+
+use common::{base64, font_file};
 use rustyprint::{RenderOptions, render};
 
 /// The text of the PDF's first page in content order, as a viewer copies it: a marked
@@ -147,4 +150,112 @@ fn latin_documents_embed_no_script_fonts() {
             .all(|f| !f.contains("Arabic") && !f.contains("NotoSansSC")),
         "{fonts:?}"
     );
+}
+
+/// Glyphs the first page draws with the missing-glyph box, CID 0.
+fn missing_glyphs(body: &str) -> usize {
+    let html = format!("<!DOCTYPE html><meta charset=utf-8><body>{body}");
+    let output = render(&html, &RenderOptions::default()).expect("renders");
+    let pdf = lopdf::Document::load_mem(&output.pdf).expect("valid PDF");
+    let page = pdf.get_pages()[&1];
+    let content = lopdf::content::Content::decode(&pdf.get_page_content(page)).unwrap();
+    let strings = content
+        .operations
+        .iter()
+        .filter(|op| matches!(op.operator.as_str(), "TJ" | "Tj"))
+        .flat_map(|op| match &op.operands[0] {
+            lopdf::Object::Array(items) => items.clone(),
+            other => vec![other.clone()],
+        });
+    strings
+        .filter_map(|s| s.as_str().map(<[u8]>::to_vec).ok())
+        .map(|bytes| bytes.chunks(2).filter(|pair| pair == &[0, 0]).count())
+        .sum()
+}
+
+/// A test font's `@font-face` source as a `data:` URL.
+fn test_font(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/css-properties/assets")
+        .join(name);
+    let bytes = std::fs::read(path).expect("the test font is in the repository");
+    format!("url(data:font/ttf;base64,{})", base64(&bytes))
+}
+
+/// A bundled font's `@font-face` source as a `data:` URL.
+fn bundled_font(name: &str) -> String {
+    format!("url(data:font/ttf;base64,{})", base64(&font_file(name)))
+}
+
+/// A cut-off table cell in the family `F`, defined by `faces`, with `overflow` as its
+/// `text-overflow`.
+fn cut_off_cell(faces: &str, weight: u16, overflow: &str) -> String {
+    format!(
+        "<style>{faces} td {{ font: {weight} 16px F, sans-serif; white-space: nowrap; \
+         overflow: hidden; text-overflow: {overflow}; width: 60px; max-width: 60px }} \
+         table {{ table-layout: fixed; width: 60px }}</style>\
+         <table><tr><td>ABABABABABABABABABAB</td></tr></table>"
+    )
+}
+
+#[track_caller]
+fn assert_ends_with_drawn(body: &str, mark: &str) {
+    let copied = copied_text(body);
+    assert!(copied.ends_with(mark), "{copied:?}");
+    assert!(copied.starts_with("AB"), "{copied:?}");
+    assert_eq!(missing_glyphs(body), 0, "{copied:?}");
+}
+
+#[test]
+fn ellipsis_in_a_font_that_has_it() {
+    for (file, weight) in [
+        ("NotoSansMono-Regular.ttf", 400),
+        ("NotoSansMono-Bold.ttf", 700),
+    ] {
+        let face = format!(
+            "@font-face {{ font-family: F; font-weight: {weight}; src: {} }}",
+            bundled_font(file)
+        );
+        assert_ends_with_drawn(&cut_off_cell(&face, weight, "ellipsis"), "\u{2026}");
+    }
+}
+
+#[test]
+fn ellipsis_falls_back_from_a_font_that_lacks_it() {
+    for weight in [400, 700] {
+        let face = format!(
+            "@font-face {{ font-family: F; font-weight: 100 900; src: {} }}",
+            test_font("simple.ttf")
+        );
+        let body = cut_off_cell(&face, weight, "ellipsis");
+        assert_ends_with_drawn(&body, "\u{2026}");
+        assert_ends_with_drawn(&cut_off_cell(&face, weight, "\"\u{bb}\""), "\u{bb}");
+    }
+}
+
+/// A family split by `unicode-range`, as web fonts are served: the later face, which
+/// comes first, lacks the ellipsis; the earlier one has it.
+#[test]
+fn ellipsis_takes_the_face_whose_range_has_it() {
+    for weight in [400, 700] {
+        let faces = format!(
+            "@font-face {{ font-family: F; font-weight: 100 900; src: {}; \
+             unicode-range: U+0000-00FF, U+2000-206F }} \
+             @font-face {{ font-family: F; font-weight: 100 900; src: {}; \
+             unicode-range: U+0100-02FF }}",
+            bundled_font(if weight == 700 {
+                "NotoSansMono-Bold.ttf"
+            } else {
+                "NotoSansMono-Regular.ttf"
+            }),
+            test_font("simple.ttf"),
+        );
+        let body = cut_off_cell(&faces, weight, "ellipsis");
+        assert_ends_with_drawn(&body, "\u{2026}");
+        let fonts = embedded_fonts(&body);
+        assert!(
+            fonts.iter().all(|f| f.contains("NotoSansMono")),
+            "{fonts:?}"
+        );
+    }
 }

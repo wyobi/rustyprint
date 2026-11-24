@@ -1,6 +1,7 @@
 //! Placing one line: bidi reordering, alignment and justification, vertical alignment and
 //! building the line's fragments (CSS 2.1 § 10.8, CSS Inline 3, CSS Text 3 §§ 7–8).
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use rustyprint_css::ComputedValues;
@@ -11,7 +12,11 @@ use rustyprint_css::properties::types::{
 use rustyprint_css::values::AbsoluteColor;
 
 use super::breaking::{Breaker, LineBreak};
-use super::paragraph::{Paragraph, SpanKind, is_ideograph, is_word_separator, spacing};
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::paragraph::{
+    Paragraph, SpanKind, grapheme_font, is_ideograph, is_word_separator, spacing,
+};
 use crate::Font;
 use crate::display::{Color, Point, Rect, TextRun, TextStroke};
 use crate::fonts::select;
@@ -155,6 +160,11 @@ impl Piece {
 }
 
 const EPSILON: f32 = 0.01;
+
+/// The width of some pieces.
+fn total(pieces: &[Piece]) -> f32 {
+    pieces.iter().map(|piece| piece.width).sum()
+}
 
 impl LineContext<'_> {
     /// Places a line and returns its fragment, positioned at the top of the content box.
@@ -326,12 +336,12 @@ impl LineContext<'_> {
             let span = p.span_at(end - 1);
             let style = span.style.clone();
             let text = Breaker::hyphen_text(&style);
-            let piece = self.extra(&text, &style, p.levels[end - 1], span.inline_box);
+            let hyphen = self.extra(&text, &style, p.levels[end - 1], span.inline_box);
             let at = pieces
                 .iter()
                 .rposition(Piece::is_content)
                 .map_or(pieces.len(), |i| i + 1);
-            pieces.insert(at, piece);
+            pieces.splice(at..at, hyphen);
         }
         pieces
     }
@@ -343,24 +353,40 @@ impl LineContext<'_> {
         style: &Arc<ComputedValues>,
         level: u8,
         inline_box: usize,
-    ) -> Piece {
-        let font = select(style).font;
-        let size = super::paragraph::adjusted_size(style, &font);
-        let glyphs = shape(&font, size, text);
-        Piece {
-            width: glyphs.iter().map(|g| g.x_advance).sum(),
-            kind: Kind::Extra {
-                text: Arc::from(text),
-                font,
-                size,
-                glyphs,
-                style: style.clone(),
-            },
-            pos: self.p.text.len(),
-            level,
-            inline_box,
-            x: 0.0,
+    ) -> Vec<Piece> {
+        let choice = select(style);
+        let size = super::paragraph::adjusted_size(style, &choice.font);
+        // Split by font, falling back for characters the first font lacks, as text does.
+        let mut script_fonts = Vec::new();
+        let mut runs: Vec<(Range<usize>, Font)> = Vec::new();
+        for (start, grapheme) in text.grapheme_indices(true) {
+            let font = grapheme_font(&choice, style, grapheme, &mut script_fonts);
+            let end = start + grapheme.len();
+            match runs.last_mut() {
+                Some((range, last)) if *last == font => range.end = end,
+                _ => runs.push((start..end, font)),
+            }
         }
+        runs.into_iter()
+            .map(|(range, font)| {
+                let text = &text[range];
+                let glyphs = shape(&font, size, text);
+                Piece {
+                    width: glyphs.iter().map(|g| g.x_advance).sum(),
+                    kind: Kind::Extra {
+                        text: Arc::from(text),
+                        font,
+                        size,
+                        glyphs,
+                        style: style.clone(),
+                    },
+                    pos: self.p.text.len(),
+                    level,
+                    inline_box,
+                    x: 0.0,
+                }
+            })
+            .collect()
     }
 
     /// Fills `leader()`s with their pattern, sharing the space left on the line between
@@ -388,7 +414,7 @@ impl LineContext<'_> {
                 continue;
             };
             let (level, inline_box) = (pieces[i].level, pieces[i].inline_box);
-            let unit = self.extra(&pattern, &style, level, inline_box).width;
+            let unit = total(&self.extra(&pattern, &style, level, inline_box));
             let copies = if unit > 0.0 {
                 (share / unit + EPSILON).floor() as usize
             } else {
@@ -400,11 +426,12 @@ impl LineContext<'_> {
                 pos: pieces[i].pos,
                 level,
                 inline_box,
-                width: (share - fill.width).max(0.0),
+                width: (share - total(&fill)).max(0.0),
                 x: 0.0,
             };
-            pieces.splice(i..=i, [gap, fill]);
-            i += 2;
+            let count = 1 + fill.len();
+            pieces.splice(i..=i, std::iter::once(gap).chain(fill));
+            i += count;
         }
     }
 
@@ -461,13 +488,13 @@ impl LineContext<'_> {
 
     /// Truncates the line to make room for an ellipsis and adds it.
     fn add_ellipsis(&self, pieces: &mut Vec<Piece>, ellipsis: &str, force: bool, width: f32) {
-        let total = |pieces: &[Piece]| pieces.iter().map(|piece| piece.width).sum::<f32>();
         if !force && total(pieces) <= width + EPSILON {
             return;
         }
         let base = u8::from(self.p.base_rtl);
         let mark = self.extra(ellipsis, self.container, base, 0);
-        while total(pieces) + mark.width > width + EPSILON {
+        let mark_width = total(&mark);
+        while total(pieces) + mark_width > width + EPSILON {
             let Some(last) = pieces.last_mut() else {
                 break;
             };
@@ -488,7 +515,7 @@ impl LineContext<'_> {
                 pieces.pop();
             }
         }
-        pieces.push(mark);
+        pieces.extend(mark);
     }
 
     /// Width of punctuation that hangs past the end of the line (`hanging-punctuation`).

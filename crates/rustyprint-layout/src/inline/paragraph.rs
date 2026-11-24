@@ -1338,11 +1338,55 @@ fn draws_in_color(font: &Font, c: char) -> bool {
         .is_some_and(|glyph| font.is_color_glyph(glyph))
 }
 
+/// The font that draws a grapheme: the first of the style's fonts that covers it, then a
+/// bundled script font, else the first available font. `script_fonts` keeps the script
+/// fonts already chosen, so a run of text reuses them.
+pub(super) fn grapheme_font(
+    choice: &FontChoice,
+    style: &ComputedValues,
+    grapheme: &str,
+    script_fonts: &mut Vec<Font>,
+) -> Font {
+    let primary = &choice.font;
+    let first = grapheme.chars().next().expect("graphemes are not empty");
+    if first == '\t' || first.is_whitespace() || first.is_control() {
+        return primary.clone();
+    }
+    let mut covering = std::iter::once(primary)
+        .chain(&choice.fallbacks)
+        .filter(|f| f.covers(first));
+    // Emoji presentation prefers a font that draws the character in color, text
+    // presentation one that does not (CSS Fonts 4 § 6.10).
+    let font = match emoji_presentation(style.font_variant_emoji, grapheme) {
+        Some(color) => {
+            let covering: Vec<&Font> = covering.collect();
+            covering
+                .iter()
+                .find(|f| draws_in_color(f, first) == color)
+                .or(covering.first())
+                .copied()
+        }
+        None => covering.next(),
+    };
+    if let Some(font) = font {
+        return font.clone();
+    }
+    if let Some(font) = script_fonts.iter().find(|f| f.covers(first)) {
+        return font.clone();
+    }
+    match fonts::script_fallback(style, first) {
+        Some(font) => {
+            script_fonts.push(font.clone());
+            font
+        }
+        None => primary.clone(),
+    }
+}
+
 /// Splits a span by bidi level, font coverage, tabs and small-caps synthesis.
 fn itemize(p: &Paragraph, span: &Span, choice: &FontChoice) -> Vec<Piece> {
     let text = &p.text[span.range.clone()];
     let primary = &choice.font;
-    let fallback_fonts = &choice.fallbacks;
     let style = &span.style;
     let synth_caps = match style.font_variant_caps {
         FontVariantCaps::SmallCaps | FontVariantCaps::PetiteCaps => {
@@ -1358,16 +1402,7 @@ fn itemize(p: &Paragraph, span: &Span, choice: &FontChoice) -> Vec<Piece> {
         FontVariantCaps::AllSmallCaps | FontVariantCaps::AllPetiteCaps
     );
     let combined = combined_bytes(style, text);
-    // Bundled script fonts already chosen in this span, as the style asks for them.
     let mut script_fonts: Vec<Font> = Vec::new();
-    let mut script_fallback = |c: char| {
-        if let Some(font) = script_fonts.iter().find(|f| f.covers(c)) {
-            return Some(font.clone());
-        }
-        let font = fonts::script_fallback(style, c)?;
-        script_fonts.push(font.clone());
-        Some(font)
-    };
     let mut pieces: Vec<Piece> = Vec::new();
     for (offset, grapheme) in text.grapheme_indices(true) {
         let start = span.range.start + offset;
@@ -1381,33 +1416,10 @@ fn itemize(p: &Paragraph, span: &Span, choice: &FontChoice) -> Vec<Piece> {
             None
         };
         // Combined text is shaped in one go, in the first available font.
-        let font = if upright == Some(Upright::Combined)
-            || first == '\t'
-            || first.is_whitespace()
-            || first.is_control()
-        {
+        let font = if upright == Some(Upright::Combined) {
             primary.clone()
         } else {
-            let mut covering = std::iter::once(primary)
-                .chain(fallback_fonts)
-                .filter(|f| f.covers(first));
-            // Emoji presentation prefers a font that draws the character in color, text
-            // presentation one that does not (CSS Fonts 4 § 6.10).
-            let font = match emoji_presentation(style.font_variant_emoji, grapheme) {
-                Some(color) => {
-                    let covering: Vec<&Font> = covering.collect();
-                    covering
-                        .iter()
-                        .find(|f| draws_in_color(f, first) == color)
-                        .or(covering.first())
-                        .copied()
-                }
-                None => covering.next(),
-            };
-            match font {
-                Some(font) => font.clone(),
-                None => script_fallback(first).unwrap_or_else(|| primary.clone()),
-            }
+            grapheme_font(choice, style, grapheme, &mut script_fonts)
         };
         let small_caps = synth_caps && (first.is_lowercase() || (all_caps && first.is_uppercase()));
         let level = p.levels[start];
